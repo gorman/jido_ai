@@ -51,6 +51,8 @@ defmodule Jido.AI.Turn do
           usage: map() | nil,
           model: String.t() | nil,
           finish_reason: atom() | nil,
+          stop_reason: String.t() | nil,
+          content_parts: list() | nil,
           message_metadata: map(),
           tool_results: list(tool_result())
         }
@@ -63,6 +65,8 @@ defmodule Jido.AI.Turn do
             usage: nil,
             model: nil,
             finish_reason: nil,
+            stop_reason: nil,
+            content_parts: nil,
             message_metadata: %{},
             tool_results: []
 
@@ -95,6 +99,8 @@ defmodule Jido.AI.Turn do
       usage: normalize_usage(ReqLLM.Response.usage(response)),
       model: Keyword.get(opts, :model, response.model),
       finish_reason: normalize_finish_reason(classified.finish_reason),
+      stop_reason: extract_stop_reason(response.provider_meta),
+      content_parts: extract_content_parts(response.message),
       message_metadata: normalize_metadata(response.message.metadata),
       tool_results: []
     }
@@ -115,6 +121,8 @@ defmodule Jido.AI.Turn do
       usage: normalize_usage(get_field(response, :usage)),
       model: Keyword.get(opts, :model, get_field(response, :model)),
       finish_reason: finish_reason,
+      stop_reason: get_field(response, :stop_reason),
+      content_parts: if(is_list(content), do: content),
       message_metadata: normalize_metadata(get_field(message, :metadata)),
       tool_results: []
     }
@@ -427,6 +435,27 @@ defmodule Jido.AI.Turn do
   defp classify_type(tool_calls, :tool_calls) when is_list(tool_calls), do: :tool_calls
   defp classify_type(tool_calls, _finish_reason) when is_list(tool_calls) and tool_calls != [], do: :tool_calls
   defp classify_type(_tool_calls, _finish_reason), do: :final_answer
+
+  @doc """
+  Whether the provider paused this turn mid-execution — Anthropic's
+  `pause_turn` stop reason (normalized to `:incomplete`, with the raw value
+  preserved in the response's provider metadata). A paused turn is not an
+  answer and not a failure: the caller resumes it by re-sending the
+  conversation with the paused assistant content appended, adding no new
+  user or tool message.
+  """
+  @spec paused?(t()) :: boolean()
+  def paused?(%__MODULE__{finish_reason: :incomplete, stop_reason: "pause_turn"}), do: true
+  def paused?(%__MODULE__{}), do: false
+
+  defp extract_stop_reason(%{} = provider_meta) do
+    Map.get(provider_meta, "stop_reason") || Map.get(provider_meta, :stop_reason)
+  end
+
+  defp extract_stop_reason(_), do: nil
+
+  defp extract_content_parts(%{content: parts}) when is_list(parts), do: parts
+  defp extract_content_parts(_), do: nil
 
   defp normalize_type(:tool_calls), do: :tool_calls
   defp normalize_type("tool_calls"), do: :tool_calls

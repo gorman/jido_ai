@@ -201,6 +201,11 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
                     fail_run(state, owner, ref, config, reason, error_type)
                 end
 
+              # The provider paused the turn; the paused assistant content is
+              # already appended, so loop straight into the next LLM call.
+              {:paused, state} ->
+                run_loop(state, owner, ref, config, context)
+
               {:tool_calls, state, tool_calls} ->
                 prev_signature = Map.get(state, :__prev_tool_signature__)
                 current_signature = tool_call_signature(tool_calls)
@@ -267,7 +272,26 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
             |> State.merge_usage(turn.usage)
             |> State.put_llm_response_id(response_id)
 
-          case validate_terminal_response(turn) do
+          # A paused turn (Turn.paused?/1) is neither an answer nor a failure,
+          # and often has blank text — it must be handled before terminal
+          # validation would reject it.
+          if Turn.paused?(turn) do
+            handle_paused_turn(state, owner, ref, config, turn, call_id)
+          else
+            run_llm_outcome(state, owner, ref, config, turn, call_id)
+          end
+
+        {:error, state, reason, error_type} ->
+          {:error, state, reason, error_type}
+      end
+    else
+      {:error, reason} ->
+        {:error, state, reason, :request_transform}
+    end
+  end
+
+  defp run_llm_outcome(%State{} = state, owner, ref, %Config{} = config, turn, call_id) do
+    case validate_terminal_response(turn) do
             :ok ->
               {state, _} =
                 emit_event(
@@ -319,14 +343,45 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
             {:error, reason} ->
               {:error, state, reason, :llm_response}
           end
+  end
 
-        {:error, state, reason, error_type} ->
-          {:error, state, reason, error_type}
-      end
-    else
-      {:error, reason} ->
-        {:error, state, reason, :request_transform}
-    end
+  # The provider paused the turn mid-execution (Anthropic's pause_turn during
+  # server-tool use). Append the paused assistant content — including the
+  # provider-native blocks the resume depends on — and loop for another LLM
+  # call with no new user or tool message, so the model continues its own
+  # turn. Counts against max_iterations like any other iteration.
+  defp handle_paused_turn(%State{} = state, owner, ref, %Config{} = config, turn, call_id) do
+    {state, _} =
+      emit_event(
+        state,
+        owner,
+        ref,
+        :llm_completed,
+        %{
+          call_id: call_id,
+          model: turn.model,
+          turn_type: turn.type,
+          text: turn.text,
+          thinking_content: turn.thinking_content,
+          reasoning_details: Map.get(turn, :reasoning_details),
+          tool_calls: turn.tool_calls,
+          usage: turn.usage,
+          finish_reason: turn.finish_reason
+        },
+        llm_call_id: call_id
+      )
+
+    context_opts = assistant_context_opts(turn) ++ [content_parts: turn.content_parts]
+
+    state =
+      state.context
+      |> AIContext.append_assistant(turn.text, nil, context_opts)
+      |> then(&%{state | context: &1})
+      |> State.inc_iteration()
+
+    {state, _token} = emit_checkpoint(state, owner, ref, config, :after_llm)
+
+    {:paused, state}
   end
 
   defp build_turn_request(%State{} = state, %Config{} = config, runtime_context) do

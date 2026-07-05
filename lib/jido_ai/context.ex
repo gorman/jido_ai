@@ -50,6 +50,7 @@ defmodule Jido.AI.Context do
     @type t :: %__MODULE__{
             role: :user | :assistant | :tool | :system,
             content: String.t() | [ContentPart.t()] | nil,
+            content_parts: [ContentPart.t()] | nil,
             thinking: String.t() | nil,
             reasoning_details: list() | nil,
             tool_calls: list() | nil,
@@ -59,7 +60,18 @@ defmodule Jido.AI.Context do
             refs: map() | nil
           }
 
-    defstruct [:role, :content, :thinking, :reasoning_details, :tool_calls, :tool_call_id, :name, :timestamp, :refs]
+    defstruct [
+      :role,
+      :content,
+      :content_parts,
+      :thinking,
+      :reasoning_details,
+      :tool_calls,
+      :tool_call_id,
+      :name,
+      :timestamp,
+      :refs
+    ]
   end
 
   @doc """
@@ -110,10 +122,12 @@ defmodule Jido.AI.Context do
     thinking = Keyword.get(opts, :thinking)
     reasoning_details = Keyword.get(opts, :reasoning_details)
     refs = Keyword.get(opts, :refs)
+    content_parts = Keyword.get(opts, :content_parts)
 
     append(thread, %Entry{
       role: :assistant,
       content: content,
+      content_parts: content_parts,
       tool_calls: tool_calls,
       thinking: thinking,
       reasoning_details: reasoning_details,
@@ -388,6 +402,23 @@ defmodule Jido.AI.Context do
 
   defp entry_to_message(%Entry{role: :user, content: content, refs: refs}) do
     %{role: :user, content: content}
+    |> maybe_add(:refs, refs)
+  end
+
+  # An assistant entry carrying full provider content parts (e.g. a paused
+  # server-tool turn) projects them verbatim — the parts already include the
+  # entry's text, so the plain-content path is skipped.
+  defp entry_to_message(%Entry{
+         role: :assistant,
+         content_parts: parts,
+         reasoning_details: reasoning_details,
+         tool_calls: tool_calls,
+         refs: refs
+       })
+       when is_list(parts) and parts != [] do
+    %{role: :assistant, content: parts}
+    |> maybe_add(:tool_calls, tool_calls)
+    |> maybe_add(:reasoning_details, reasoning_details)
     |> maybe_add(:refs, refs)
   end
 
