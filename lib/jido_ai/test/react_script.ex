@@ -148,6 +148,9 @@ defmodule Jido.AI.Test.ReActScript do
 
       %{type: :tool_call} = turn ->
         {:ok, response(script, turn)}
+
+      %{type: :pause} = turn ->
+        {:ok, response(script, turn)}
     end
   end
 
@@ -194,6 +197,38 @@ defmodule Jido.AI.Test.ReActScript do
     }
   end
 
+  # A paused provider turn: finish_reason :incomplete with the raw pause_turn
+  # stop reason, and a provider-native block in the content so the resume path
+  # (context round-trip of the full content parts) is actually exercised.
+  defp response(%__MODULE__{} = script, %{type: :pause} = turn) do
+    text = Map.get(turn, :text, "")
+
+    text_parts =
+      if text == "", do: [], else: [ReqLLM.Message.ContentPart.text(text)]
+
+    parts =
+      [
+        %ReqLLM.Message.ContentPart{
+          type: :provider_block,
+          data: %{"type" => "server_tool_use", "id" => "srvtoolu_#{script.id}"},
+          metadata: %{provider: :anthropic}
+        }
+        | text_parts
+      ]
+
+    %{
+      message: %{
+        content: parts,
+        tool_calls: nil,
+        metadata: %{react_test_script_id: script.id}
+      },
+      finish_reason: :incomplete,
+      stop_reason: "pause_turn",
+      usage: Map.get(turn, :usage, %{}),
+      model: Map.get(turn, :model)
+    }
+  end
+
   defp maybe_unregister(%__MODULE__{} = script, :registry) do
     :ets.delete(table(), registry_key(owner_key(), script.user))
     :ok
@@ -222,6 +257,9 @@ defmodule Jido.AI.Test.ReActScript do
         %{type: :tool_call} = turn, {acc, call_index, false} ->
           next_index = call_index + 1
           {[normalize_tool_call_turn!(turn, next_index) | acc], next_index, false}
+
+        %{type: :pause} = turn, {acc, call_index, false} ->
+          {[normalize_pause_turn!(turn) | acc], call_index, false}
 
         %{type: :answer} = turn, {acc, call_index, false} ->
           {[normalize_answer_turn!(turn) | acc], call_index, true}
@@ -260,6 +298,16 @@ defmodule Jido.AI.Test.ReActScript do
       ],
       finish_reason: :tool_calls,
       usage: Map.get(turn, :usage, opts[:usage] || %{})
+    }
+  end
+
+  defp normalize_pause_turn!(%{text: text} = turn) do
+    opts = Map.get(turn, :opts, []) || []
+
+    %{
+      type: :pause,
+      text: normalize_content(text),
+      usage: opts[:usage] || %{}
     }
   end
 
@@ -307,12 +355,30 @@ defmodule Jido.AI.Test.ReActScript do
     end)
   end
 
+  # Counts the assistant turns the script has already produced: tool-call
+  # rounds and paused turns (whose appended content carries provider-native
+  # blocks) both advance the script position.
   defp consumed_tool_turns(messages) when is_list(messages) do
     Enum.count(messages, fn
-      %{role: role, tool_calls: calls} when role in [:assistant, "assistant"] -> non_empty_list?(calls)
-      %ReqLLM.Message{role: role, tool_calls: calls} when role in [:assistant, "assistant"] -> non_empty_list?(calls)
-      _other -> false
+      %{role: role} = message when role in [:assistant, "assistant"] ->
+        non_empty_list?(Map.get(message, :tool_calls)) or paused_assistant?(message)
+
+      %ReqLLM.Message{role: role} = message when role in [:assistant, "assistant"] ->
+        non_empty_list?(message.tool_calls) or paused_assistant?(message)
+
+      _other ->
+        false
     end)
+  end
+
+  defp paused_assistant?(message) do
+    case Map.get(message, :content) do
+      content when is_list(content) ->
+        Enum.any?(content, &match?(%ReqLLM.Message.ContentPart{type: :provider_block}, &1))
+
+      _ ->
+        false
+    end
   end
 
   defp non_empty_list?([_ | _]), do: true

@@ -66,6 +66,16 @@ defmodule Jido.AI.Test do
   end
 
   @doc """
+  Adds a scripted provider pause (Anthropic `pause_turn`): the model's turn is
+  cut mid-execution and the runner is expected to resume it with no new user
+  or tool message. Non-terminal — follow it with more turns.
+  """
+  @spec pause(String.t(), keyword()) :: :ok
+  def pause(text \\ "", opts \\ []) when is_binary(text) and is_list(opts) do
+    add_turn!(%{type: :pause, text: text, opts: opts})
+  end
+
+  @doc """
   Adds the final scripted model answer.
   """
   @spec answer(term(), keyword()) :: :ok
