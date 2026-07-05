@@ -1441,6 +1441,7 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
     []
     |> Keyword.put(:on_chunk, fn chunk ->
       note_stream_chunk_activity(chunk, state_key, usage_key, owner, ref, trace_cfg, heartbeat_interval_ms)
+      maybe_emit_server_tool_started(chunk, state_key, owner, ref, model)
     end)
     |> maybe_put_stream_callback(trace_cfg, :on_result, fn text ->
       emit_stream_delta(state_key, owner, ref, :content, text, model)
@@ -1459,6 +1460,22 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
       _ -> opts
     end
   end
+
+  # A provider-executed (server) tool started inside the API. Surface it the
+  # same way a client tool call's streamed name is surfaced, so downstream
+  # consumers can show activity while the tool runs server-side.
+  defp maybe_emit_server_tool_started(
+         %ReqLLM.StreamChunk{type: :meta, metadata: %{server_tool_started: name}},
+         state_key,
+         owner,
+         ref,
+         model
+       )
+       when is_binary(name) do
+    emit_stream_delta(state_key, owner, ref, :tool_call, name, model)
+  end
+
+  defp maybe_emit_server_tool_started(_chunk, _state_key, _owner, _ref, _model), do: :ok
 
   defp emit_stream_delta(_state_key, _owner, _ref, _chunk_type, text, _model) when text in [nil, ""], do: :ok
 
