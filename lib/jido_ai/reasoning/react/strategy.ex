@@ -1608,6 +1608,7 @@ defmodule Jido.AI.Reasoning.ReAct.Strategy do
         text = event_field(data, :text, "")
         thinking_content = event_field(data, :thinking_content)
         reasoning_details = event_field(data, :reasoning_details)
+        content_parts = event_field(data, :content_parts)
         tool_calls = event_field(data, :tool_calls, [])
         usage = event_field(data, :usage, %{})
         call_id = llm_call_id || event_field(data, :call_id, "")
@@ -1635,6 +1636,7 @@ defmodule Jido.AI.Reasoning.ReAct.Strategy do
             tool_calls,
             thinking_content,
             reasoning_details,
+            content_parts,
             refs
           )
           |> Map.update(:usage, usage || %{}, fn existing ->
@@ -2095,6 +2097,7 @@ defmodule Jido.AI.Reasoning.ReAct.Strategy do
          tool_calls,
          thinking_content,
          reasoning_details,
+         content_parts,
          refs
        ) do
     context = Map.get(state, :run_context) || Map.get(state, :context)
@@ -2107,6 +2110,7 @@ defmodule Jido.AI.Reasoning.ReAct.Strategy do
           []
           |> maybe_put_assistant_context_opt(:thinking, thinking_content)
           |> maybe_put_assistant_context_opt(:reasoning_details, reasoning_details)
+          |> maybe_put_assistant_context_opt(:content_parts, content_parts)
           |> maybe_put_assistant_context_opt(:refs, normalize_refs(refs))
 
         Map.put(

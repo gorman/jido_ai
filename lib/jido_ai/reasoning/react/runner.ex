@@ -306,6 +306,7 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
                     text: turn.text,
                     thinking_content: turn.thinking_content,
                     reasoning_details: Map.get(turn, :reasoning_details),
+                    content_parts: provider_content_parts(turn),
                     tool_calls: turn.tool_calls,
                     usage: turn.usage,
                     finish_reason: turn.finish_reason
@@ -321,7 +322,7 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
                     :tool_calls -> turn.tool_calls
                     _ -> nil
                   end,
-                  assistant_context_opts(turn)
+                  assistant_context_opts(turn) ++ [content_parts: provider_content_parts(turn)]
                 )
                 |> then(&%{state | context: &1})
 
@@ -364,6 +365,7 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
           text: turn.text,
           thinking_content: turn.thinking_content,
           reasoning_details: Map.get(turn, :reasoning_details),
+          content_parts: turn.content_parts,
           tool_calls: turn.tool_calls,
           usage: turn.usage,
           finish_reason: turn.finish_reason
@@ -1233,6 +1235,16 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
 
   defp maybe_put_assistant_context_opt(opts, _key, nil), do: opts
   defp maybe_put_assistant_context_opt(opts, key, value), do: Keyword.put(opts, key, value)
+
+  # Full content parts ride the assistant entry only when the turn produced
+  # provider-native blocks (server tools): those must be replayed verbatim on
+  # subsequent requests (encrypted_content), while every other turn keeps the
+  # plain text/tool_calls projection.
+  defp provider_content_parts(%Turn{content_parts: parts}) when is_list(parts) do
+    if Enum.any?(parts, &match?(%{type: :provider_block}, &1)), do: parts
+  end
+
+  defp provider_content_parts(_), do: nil
 
   defp apply_stream_accumulator(%Turn{} = turn, %State{} = state) do
     turn
