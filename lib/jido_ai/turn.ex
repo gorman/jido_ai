@@ -52,6 +52,7 @@ defmodule Jido.AI.Turn do
           model: String.t() | nil,
           finish_reason: atom() | nil,
           stop_reason: String.t() | nil,
+          container_id: String.t() | nil,
           content_parts: list() | nil,
           message_metadata: map(),
           tool_results: list(tool_result())
@@ -66,6 +67,7 @@ defmodule Jido.AI.Turn do
             model: nil,
             finish_reason: nil,
             stop_reason: nil,
+            container_id: nil,
             content_parts: nil,
             message_metadata: %{},
             tool_results: []
@@ -100,6 +102,7 @@ defmodule Jido.AI.Turn do
       model: Keyword.get(opts, :model, response.model),
       finish_reason: normalize_finish_reason(classified.finish_reason),
       stop_reason: extract_stop_reason(response.provider_meta),
+      container_id: extract_container_id(response.provider_meta),
       content_parts: extract_content_parts(response.message),
       message_metadata: normalize_metadata(response.message.metadata),
       tool_results: []
@@ -453,6 +456,18 @@ defmodule Jido.AI.Turn do
   end
 
   defp extract_stop_reason(_), do: nil
+
+  # The code-execution sandbox id (Anthropic `container`). A pause_turn cut
+  # with pending code-execution tool uses can only resume when the follow-up
+  # request carries this id back.
+  defp extract_container_id(%{} = provider_meta) do
+    case Map.get(provider_meta, "container") || Map.get(provider_meta, :container) do
+      %{} = container -> Map.get(container, "id") || Map.get(container, :id)
+      _ -> nil
+    end
+  end
+
+  defp extract_container_id(_), do: nil
 
   defp extract_content_parts(%{content: parts}) when is_list(parts), do: parts
   defp extract_content_parts(_), do: nil

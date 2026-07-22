@@ -267,10 +267,17 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
 
       case request_turn(state, owner, ref, config, request.messages, request.llm_opts, request.model) do
         {:ok, state, turn, response_id} ->
+          # A paused turn's pending code-execution tool uses can only resume
+          # inside their original sandbox, so its container id must ride the
+          # next request. A completed turn clears it — containers expire, so
+          # the id never outlives the pause it belongs to.
+          container_id = if Turn.paused?(turn), do: turn.container_id || state.container_id
+
           state =
             state
             |> State.merge_usage(turn.usage)
             |> State.put_llm_response_id(response_id)
+            |> State.put_container_id(container_id)
 
           # A paused turn (Turn.paused?/1) is neither an answer nor a failure,
           # and often has blank text — it must be handled before terminal
@@ -389,7 +396,11 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   defp build_turn_request(%State{} = state, %Config{} = config, runtime_context) do
     base_request = %{
       messages: AIContext.to_messages(state.context),
-      llm_opts: config |> Config.llm_opts() |> maybe_put_previous_response_id(state.llm_response_id),
+      llm_opts:
+        config
+        |> Config.llm_opts()
+        |> maybe_put_previous_response_id(state.llm_response_id)
+        |> maybe_put_container(state.container_id),
       tools: config.tools,
       model: config.model
     }
@@ -589,6 +600,16 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   end
 
   defp maybe_put_previous_response_id(llm_opts, _response_id), do: llm_opts
+
+  # Anthropic-specific by necessity: pause_turn resume is an Anthropic
+  # protocol feature (like Turn.paused?/1), and other providers never set a
+  # container id, so the option is inert everywhere else.
+  defp maybe_put_container(llm_opts, container_id)
+       when is_list(llm_opts) and is_binary(container_id) do
+    Keyword.put(llm_opts, :anthropic_container, container_id)
+  end
+
+  defp maybe_put_container(llm_opts, _container_id), do: llm_opts
 
   defp normalize_provider_options(options) when is_list(options), do: Enum.reject(options, fn {k, _v} -> is_nil(k) end)
 

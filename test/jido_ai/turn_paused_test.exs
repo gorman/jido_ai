@@ -40,6 +40,26 @@ defmodule Jido.AI.TurnPausedTest do
       refute Turn.paused?(%Turn{finish_reason: :incomplete, stop_reason: nil})
       refute Turn.paused?(%Turn{finish_reason: :stop, stop_reason: "pause_turn"})
     end
+
+    test "from_response carries the code-execution container id" do
+      response = paused_response()
+
+      provider_meta =
+        Map.put(response.provider_meta, "container", %{
+          "id" => "container_abc",
+          "expires_at" => "2026-01-01T00:00:00Z"
+        })
+
+      turn = Turn.from_response(%{response | provider_meta: provider_meta})
+
+      assert turn.container_id == "container_abc"
+    end
+
+    test "container_id is nil when the response reports no container" do
+      turn = Turn.from_response(paused_response())
+
+      assert turn.container_id == nil
+    end
   end
 
   describe "context round-trip of paused assistant content" do

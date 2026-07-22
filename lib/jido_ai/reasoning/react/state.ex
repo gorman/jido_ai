@@ -19,6 +19,7 @@ defmodule Jido.AI.Reasoning.ReAct.State do
               iteration: Zoi.integer() |> Zoi.default(1),
               llm_call_id: Zoi.string() |> Zoi.nullish(),
               llm_response_id: Zoi.string() |> Zoi.nullish(),
+              container_id: Zoi.string() |> Zoi.nullish(),
               context: Zoi.any(),
               active_tools: Zoi.map() |> Zoi.default(%{}),
               pending_tool_calls: Zoi.list(PendingToolCall.schema()) |> Zoi.default([]),
@@ -102,6 +103,7 @@ defmodule Jido.AI.Reasoning.ReAct.State do
         iteration: Map.get(map, :iteration, Map.get(map, "iteration", 1)),
         llm_call_id: Map.get(map, :llm_call_id, Map.get(map, "llm_call_id")),
         llm_response_id: Map.get(map, :llm_response_id, Map.get(map, "llm_response_id")),
+        container_id: Map.get(map, :container_id, Map.get(map, "container_id")),
         context: context,
         active_tools: Map.get(map, :active_tools, Map.get(map, "active_tools", %{})) || %{},
         pending_tool_calls: restore_pending(Map.get(map, :pending_tool_calls, Map.get(map, "pending_tool_calls", []))),
@@ -138,6 +140,7 @@ defmodule Jido.AI.Reasoning.ReAct.State do
       iteration: state.iteration,
       llm_call_id: state.llm_call_id,
       llm_response_id: state.llm_response_id,
+      container_id: state.container_id,
       context: state.context,
       active_tools: state.active_tools,
       pending_tool_calls: state.pending_tool_calls,
@@ -192,6 +195,16 @@ defmodule Jido.AI.Reasoning.ReAct.State do
   @spec put_llm_response_id(t(), String.t() | nil) :: t()
   def put_llm_response_id(%__MODULE__{} = state, response_id) do
     %{state | llm_response_id: response_id, updated_at_ms: now_ms()}
+  end
+
+  @doc """
+  Stores the code-execution container id a paused turn must resume inside
+  (`nil` once the turn completes — containers expire, so it never outlives
+  the pause it belongs to).
+  """
+  @spec put_container_id(t(), String.t() | nil) :: t()
+  def put_container_id(%__MODULE__{} = state, container_id) do
+    %{state | container_id: container_id, updated_at_ms: now_ms()}
   end
 
   @doc """
