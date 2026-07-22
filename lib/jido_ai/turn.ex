@@ -534,9 +534,21 @@ defmodule Jido.AI.Turn do
       name: normalize_text(extract_tool_call_name(tool_call)),
       arguments: normalize_tool_arguments(extract_tool_call_arguments(tool_call))
     }
+    |> maybe_mark_args_lost(tool_call)
   end
 
   defp normalize_tool_call(other), do: other
+
+  # The provider tags a tool call whose arguments were cut off in transport
+  # (e.g. the API ended the stream mid-call). Executing such a call with the
+  # empty fallback args would silently do the wrong thing, so the flag rides
+  # along for the runner to refuse execution.
+  defp maybe_mark_args_lost(normalized, tool_call) do
+    case ReqLLM.ToolCall.metadata(tool_call) do
+      %{error: {:args_lost, _reason}} -> Map.put(normalized, :args_lost, true)
+      _ -> normalized
+    end
+  end
 
   defp assistant_tool_calls(%__MODULE__{type: :tool_calls, tool_calls: tool_calls}) when is_list(tool_calls),
     do: tool_calls

@@ -198,9 +198,10 @@ defmodule Jido.AI.Reasoning.ReAct.State do
   end
 
   @doc """
-  Stores the code-execution container id a paused turn must resume inside
-  (`nil` once the turn completes — containers expire, so it never outlives
-  the pause it belongs to).
+  Stores the code-execution container id the run's in-flight requests must
+  carry (pause resumes and tool-result rounds alike); `nil` once the turn
+  completes — containers expire, so the id never outlives the work it
+  belongs to.
   """
   @spec put_container_id(t(), String.t() | nil) :: t()
   def put_container_id(%__MODULE__{} = state, container_id) do

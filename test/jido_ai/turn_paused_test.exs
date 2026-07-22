@@ -62,6 +62,52 @@ defmodule Jido.AI.TurnPausedTest do
     end
   end
 
+  describe "args_lost tool calls" do
+    defp response_with_tool_call(tool_call) do
+      %ReqLLM.Response{
+        id: "msg_1",
+        model: "claude-sonnet-4-6",
+        context: %ReqLLM.Context{messages: []},
+        message: %ReqLLM.Message{
+          role: :assistant,
+          content: [],
+          tool_calls: [tool_call],
+          metadata: %{}
+        },
+        stream?: false,
+        stream: nil,
+        usage: %{input_tokens: 1, output_tokens: 1},
+        finish_reason: :tool_calls,
+        provider_meta: %{}
+      }
+    end
+
+    test "a transport-truncated tool call is flagged through normalization" do
+      tool_call =
+        ReqLLM.ToolCall.new("toolu_1", "propose_moments", "{}")
+        |> ReqLLM.ToolCall.put_metadata(%{error: {:args_lost, :missing_fragments}})
+
+      turn = Turn.from_response(response_with_tool_call(tool_call))
+
+      assert [%{name: "propose_moments", args_lost: true}] = turn.tool_calls
+
+      assert %Jido.AI.Reasoning.ReAct.PendingToolCall{args_lost: true} =
+               Jido.AI.Reasoning.ReAct.PendingToolCall.from_tool_call(hd(turn.tool_calls))
+    end
+
+    test "an intact tool call carries no args_lost flag" do
+      tool_call = ReqLLM.ToolCall.new("toolu_2", "list_moments", ~s({"limit":5}))
+
+      turn = Turn.from_response(response_with_tool_call(tool_call))
+
+      assert [normalized] = turn.tool_calls
+      refute Map.has_key?(normalized, :args_lost)
+
+      assert %Jido.AI.Reasoning.ReAct.PendingToolCall{args_lost: false} =
+               Jido.AI.Reasoning.ReAct.PendingToolCall.from_tool_call(normalized)
+    end
+  end
+
   describe "context round-trip of paused assistant content" do
     test "an assistant entry with content_parts projects them verbatim" do
       parts = [

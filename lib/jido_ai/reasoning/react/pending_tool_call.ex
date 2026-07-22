@@ -9,6 +9,7 @@ defmodule Jido.AI.Reasoning.ReAct.PendingToolCall do
               id: Zoi.string(description: "LLM tool call ID"),
               name: Zoi.string(description: "Tool/action name"),
               arguments: Zoi.map(description: "Tool call arguments") |> Zoi.default(%{}),
+              args_lost: Zoi.boolean(description: "Arguments were cut off in transport") |> Zoi.default(false),
               status: Zoi.atom(description: "Execution status") |> Zoi.default(:pending),
               result: Zoi.any(description: "Raw tool execution result") |> Zoi.optional(),
               attempts: Zoi.integer(description: "Execution attempts") |> Zoi.default(0),
@@ -36,7 +37,8 @@ defmodule Jido.AI.Reasoning.ReAct.PendingToolCall do
     attrs = %{
       id: to_string(Map.get(tool_call, :id, Map.get(tool_call, "id", ""))),
       name: to_string(Map.get(tool_call, :name, Map.get(tool_call, "name", ""))),
-      arguments: Map.get(tool_call, :arguments, Map.get(tool_call, "arguments", %{})) || %{}
+      arguments: Map.get(tool_call, :arguments, Map.get(tool_call, "arguments", %{})) || %{},
+      args_lost: Map.get(tool_call, :args_lost, Map.get(tool_call, "args_lost", false)) == true
     }
 
     case Zoi.parse(@schema, attrs) do

@@ -267,11 +267,19 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
 
       case request_turn(state, owner, ref, config, request.messages, request.llm_opts, request.model) do
         {:ok, state, turn, response_id} ->
-          # A paused turn's pending code-execution tool uses can only resume
-          # inside their original sandbox, so its container id must ride the
-          # next request. A completed turn clears it — containers expire, so
-          # the id never outlives the pause it belongs to.
-          container_id = if Turn.paused?(turn), do: turn.container_id || state.container_id
+          # A response that ran code execution reports its sandbox container,
+          # and every later request in the run must carry the id while work is
+          # still in flight — resuming a pause_turn, or returning results for
+          # tool uses the sandbox generated programmatically — or the API
+          # rejects the request ("container_id is required"). A final answer
+          # clears it: containers expire, so the id must not leak into later
+          # runs.
+          container_id =
+            cond do
+              is_binary(turn.container_id) -> turn.container_id
+              Turn.paused?(turn) or Turn.needs_tools?(turn) -> state.container_id
+              true -> nil
+            end
 
           state =
             state
@@ -955,6 +963,22 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   end
 
   defp delete_in_path(map, _path), do: map
+
+  # Never execute a call whose arguments were cut off in transport — the
+  # empty fallback args would silently do the wrong thing (imagine a
+  # mutation running with all-default arguments). The error tool_result
+  # tells the model to re-issue the call, which also satisfies the API
+  # requirement that every tool_use id gets a result.
+  defp execute_tool_with_retries(%PendingToolCall{args_lost: true} = pending_call, %Config{}, _context) do
+    {pending_call,
+     {:error,
+      %{
+        type: :args_lost,
+        message:
+          "The arguments for this call to '#{pending_call.name}' did not arrive intact " <>
+            "(the stream was interrupted mid-call). Issue the tool call again."
+      }, []}, 1, 0}
+  end
 
   defp execute_tool_with_retries(%PendingToolCall{} = pending_call, %Config{} = config, context) do
     module = Map.get(config.tools, pending_call.name)
