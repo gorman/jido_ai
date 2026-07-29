@@ -62,6 +62,19 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerTest do
     def run(%{a: a, b: b}, _context), do: {:ok, %{result: a + b}}
   end
 
+  defmodule TerminalTool do
+    use Jido.Action,
+      name: "terminal_tool",
+      description: "ends the turn once it succeeds",
+      schema:
+        Zoi.object(%{
+          succeed: Zoi.boolean()
+        })
+
+    def run(%{succeed: true}, _context), do: {:ok, %{done: true}}
+    def run(%{succeed: false}, _context), do: {:error, :badarg}
+  end
+
   defmodule ContextEchoTool do
     use Jido.Action,
       name: "context_echo_tool",
@@ -1253,6 +1266,156 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerTest do
     refute is_nil(tool_completed)
     assert tool_completed.data.attempts == 1
     assert match?({:error, _, _}, tool_completed.data.result)
+  end
+
+  describe "terminal_tools" do
+    test "completes the run after a terminal tool succeeds, with no further LLM round" do
+      Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
+        count = :persistent_term.get({__MODULE__, :llm_call_count}, 0) + 1
+        :persistent_term.put({__MODULE__, :llm_call_count}, count)
+
+        {:ok,
+         responses_stream_response(
+           [
+             ReqLLM.StreamChunk.text("Here is the answer"),
+             ReqLLM.StreamChunk.tool_call("terminal_tool", %{"succeed" => true}, %{id: "tc_terminal"})
+           ],
+           %{finish_reason: :tool_calls, usage: %{input_tokens: 5, output_tokens: 3}},
+           model
+         )}
+      end)
+
+      config =
+        Config.new(%{
+          model: :capable,
+          tools: %{TerminalTool.name() => TerminalTool},
+          terminal_tools: [TerminalTool],
+          tool_max_retries: 0
+        })
+
+      events = ReAct.stream("Answer then wrap up", config) |> Enum.to_list()
+
+      assert :persistent_term.get({__MODULE__, :llm_call_count}, 0) == 1
+      assert Enum.count(events, &(&1.kind == :llm_started)) == 1
+
+      # The result event must reach consumers before the run ends — anything
+      # riding on it (suggestion chips, cards) is delivered by that event.
+      kinds = events |> Enum.map(& &1.kind) |> Enum.filter(&(&1 in [:tool_completed, :request_completed]))
+      assert kinds == [:tool_completed, :request_completed]
+
+      completed = Enum.find(events, &(&1.kind == :request_completed))
+      assert completed.data.termination_reason == :final_answer
+      assert completed.data.result == "Here is the answer"
+    end
+
+    test "runs every tool in the round before a terminal tool completes it" do
+      Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
+        count = :persistent_term.get({__MODULE__, :llm_call_count}, 0) + 1
+        :persistent_term.put({__MODULE__, :llm_call_count}, count)
+
+        {:ok,
+         responses_stream_response(
+           [
+             ReqLLM.StreamChunk.tool_call("calculator", %{"a" => 2, "b" => 3}, %{id: "tc_calc_terminal"}),
+             ReqLLM.StreamChunk.tool_call("terminal_tool", %{"succeed" => true}, %{id: "tc_terminal_pair"})
+           ],
+           %{finish_reason: :tool_calls, usage: %{input_tokens: 5, output_tokens: 3}},
+           model
+         )}
+      end)
+
+      config =
+        Config.new(%{
+          model: :capable,
+          tools: %{CalculatorTool.name() => CalculatorTool, TerminalTool.name() => TerminalTool},
+          terminal_tools: [TerminalTool],
+          tool_max_retries: 0
+        })
+
+      events = ReAct.stream("Add and wrap up", config) |> Enum.to_list()
+
+      completed_tools =
+        events |> Enum.filter(&(&1.kind == :tool_completed)) |> Enum.map(& &1.tool_name)
+
+      assert completed_tools == ["calculator", "terminal_tool"]
+      assert :persistent_term.get({__MODULE__, :llm_call_count}, 0) == 1
+      assert Enum.any?(events, &(&1.kind == :request_completed))
+    end
+
+    test "keeps reasoning when the terminal tool fails" do
+      Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
+        count = :persistent_term.get({__MODULE__, :llm_call_count}, 0) + 1
+        :persistent_term.put({__MODULE__, :llm_call_count}, count)
+
+        if count == 1 do
+          {:ok,
+           responses_stream_response(
+             [ReqLLM.StreamChunk.tool_call("terminal_tool", %{"succeed" => false}, %{id: "tc_terminal_failed"})],
+             %{finish_reason: :tool_calls, usage: %{input_tokens: 5, output_tokens: 3}},
+             model
+           )}
+        else
+          {:ok,
+           responses_stream_response(
+             [ReqLLM.StreamChunk.text("Recovered")],
+             %{finish_reason: :stop, usage: %{input_tokens: 2, output_tokens: 1}},
+             model
+           )}
+        end
+      end)
+
+      config =
+        Config.new(%{
+          model: :capable,
+          tools: %{TerminalTool.name() => TerminalTool},
+          terminal_tools: [TerminalTool],
+          tool_max_retries: 0
+        })
+
+      events = ReAct.stream("Try the terminal tool", config) |> Enum.to_list()
+
+      assert :persistent_term.get({__MODULE__, :llm_call_count}, 0) == 2
+
+      completed = Enum.find(events, &(&1.kind == :request_completed))
+      assert completed.data.result == "Recovered"
+    end
+
+    test "an undeclared tool leaves the loop running" do
+      Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
+        count = :persistent_term.get({__MODULE__, :llm_call_count}, 0) + 1
+        :persistent_term.put({__MODULE__, :llm_call_count}, count)
+
+        if count == 1 do
+          {:ok,
+           responses_stream_response(
+             [ReqLLM.StreamChunk.tool_call("terminal_tool", %{"succeed" => true}, %{id: "tc_terminal_off"})],
+             %{finish_reason: :tool_calls, usage: %{input_tokens: 5, output_tokens: 3}},
+             model
+           )}
+        else
+          {:ok,
+           responses_stream_response(
+             [ReqLLM.StreamChunk.text("All done")],
+             %{finish_reason: :stop, usage: %{input_tokens: 2, output_tokens: 1}},
+             model
+           )}
+        end
+      end)
+
+      config =
+        Config.new(%{
+          model: :capable,
+          tools: %{TerminalTool.name() => TerminalTool},
+          tool_max_retries: 0
+        })
+
+      events = ReAct.stream("Call the tool", config) |> Enum.to_list()
+
+      assert :persistent_term.get({__MODULE__, :llm_call_count}, 0) == 2
+
+      completed = Enum.find(events, &(&1.kind == :request_completed))
+      assert completed.data.result == "All done"
+    end
   end
 
   test "preflight tool callback can block a tool round before execution" do

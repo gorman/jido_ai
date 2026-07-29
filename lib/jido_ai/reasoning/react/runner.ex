@@ -168,6 +168,9 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
           {:ok, state, context} ->
             run_loop(state, owner, ref, config, context)
 
+          {:terminal, state, context} ->
+            settle_final_answer(state, owner, ref, config, context)
+
           {:error, state, reason, error_type} ->
             fail_run(state, owner, ref, config, reason, error_type)
         end
@@ -190,16 +193,7 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
           {:ok, state} ->
             case run_llm_step(state, owner, ref, config, context) do
               {:final_answer, state} ->
-                case maybe_continue_after_final_answer(state, owner, ref, config) do
-                  {:continue, state} ->
-                    run_loop(state, owner, ref, config, context)
-
-                  {:complete, state} ->
-                    state
-
-                  {:error, state, reason, error_type} ->
-                    fail_run(state, owner, ref, config, reason, error_type)
-                end
+                settle_final_answer(state, owner, ref, config, context)
 
               # The provider paused the turn; the paused assistant content is
               # already appended, so loop straight into the next LLM call.
@@ -224,6 +218,9 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
 
                     run_loop(state, owner, ref, config, context)
 
+                  {:terminal, state, context} ->
+                    settle_final_answer(state, owner, ref, config, context)
+
                   {:error, state, reason, error_type} ->
                     fail_run(state, owner, ref, config, reason, error_type)
                 end
@@ -235,6 +232,19 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
           {:error, state, reason} ->
             fail_run(state, owner, ref, config, {:pending_input_server, reason}, :runtime)
         end
+    end
+  end
+
+  defp settle_final_answer(%State{} = state, owner, ref, %Config{} = config, context) do
+    case maybe_continue_after_final_answer(state, owner, ref, config) do
+      {:continue, state} ->
+        run_loop(state, owner, ref, config, context)
+
+      {:complete, state} ->
+        state
+
+      {:error, state, reason, error_type} ->
+        fail_run(state, owner, ref, config, reason, error_type)
     end
   end
 
@@ -307,58 +317,67 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
 
   defp run_llm_outcome(%State{} = state, owner, ref, %Config{} = config, turn, call_id) do
     case validate_terminal_response(turn) do
-            :ok ->
-              {state, _} =
-                emit_event(
-                  state,
-                  owner,
-                  ref,
-                  :llm_completed,
-                  %{
-                    call_id: call_id,
-                    model: turn.model,
-                    turn_type: turn.type,
-                    text: turn.text,
-                    thinking_content: turn.thinking_content,
-                    reasoning_details: Map.get(turn, :reasoning_details),
-                    content_parts: provider_content_parts(turn),
-                    tool_calls: turn.tool_calls,
-                    usage: turn.usage,
-                    finish_reason: turn.finish_reason
-                  },
-                  llm_call_id: call_id
-                )
+      :ok ->
+        {state, _} =
+          emit_event(
+            state,
+            owner,
+            ref,
+            :llm_completed,
+            %{
+              call_id: call_id,
+              model: turn.model,
+              turn_type: turn.type,
+              text: turn.text,
+              thinking_content: turn.thinking_content,
+              reasoning_details: Map.get(turn, :reasoning_details),
+              content_parts: provider_content_parts(turn),
+              tool_calls: turn.tool_calls,
+              usage: turn.usage,
+              finish_reason: turn.finish_reason
+            },
+            llm_call_id: call_id
+          )
 
-              state =
-                AIContext.append_assistant(
-                  state.context,
-                  turn.text,
-                  case turn.type do
-                    :tool_calls -> turn.tool_calls
-                    _ -> nil
-                  end,
-                  assistant_context_opts(turn) ++ [content_parts: provider_content_parts(turn)]
-                )
-                |> then(&%{state | context: &1})
+        state =
+          AIContext.append_assistant(
+            state.context,
+            turn.text,
+            case turn.type do
+              :tool_calls -> turn.tool_calls
+              _ -> nil
+            end,
+            assistant_context_opts(turn) ++ [content_parts: provider_content_parts(turn)]
+          )
+          |> then(&%{state | context: &1})
 
-              {state, _token} = emit_checkpoint(state, owner, ref, config, :after_llm)
+        {state, _token} = emit_checkpoint(state, owner, ref, config, :after_llm)
 
-              case Turn.needs_tools?(turn) do
-                true ->
-                  {:tool_calls, State.put_status(state, :awaiting_tools), turn.tool_calls}
+        case Turn.needs_tools?(turn) do
+          true ->
+            # Carry this round's prose forward as the provisional result: a
+            # terminal tool can end the run without a further LLM response,
+            # and this is then the answer the model actually gave. A round
+            # that keeps looping overwrites it.
+            awaiting =
+              state
+              |> State.put_result(turn.text)
+              |> State.put_status(:awaiting_tools)
 
-                _ ->
-                  completed =
-                    state
-                    |> State.put_status(:completed)
-                    |> State.put_result(turn.text)
+            {:tool_calls, awaiting, turn.tool_calls}
 
-                  {:final_answer, completed}
-              end
+          _ ->
+            completed =
+              state
+              |> State.put_status(:completed)
+              |> State.put_result(turn.text)
 
-            {:error, reason} ->
-              {:error, state, reason, :llm_response}
-          end
+            {:final_answer, completed}
+        end
+
+      {:error, reason} ->
+        {:error, state, reason, :llm_response}
+    end
   end
 
   # The provider paused the turn mid-execution (Anthropic's pause_turn during
@@ -806,11 +825,35 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
           |> Map.put(:context, updated_context)
 
         {state, _token} = emit_checkpoint(state, owner, ref, config, :after_tools)
-        {:ok, state, evolve_context_state_snapshot(context, results)}
+        next_context = evolve_context_state_snapshot(context, results)
+
+        # Terminal tools are checked only once the whole round has run, so a
+        # round that pairs one with other calls still executes all of them and
+        # every result reaches the event stream before the run completes.
+        if terminal_tool_succeeded?(results, config) do
+          {:terminal, State.put_status(state, :completed), next_context}
+        else
+          {:ok, state, next_context}
+        end
 
       {:error, reason} ->
         {:error, State.put_status(state, :failed), reason, :tool_guardrail}
     end
+  end
+
+  # A failed terminal tool must not end the turn — the model still has to see the
+  # error and react to it.
+  defp terminal_tool_succeeded?(results, %Config{} = config) do
+    Enum.any?(results, fn
+      {%PendingToolCall{name: name}, {:ok, _value, _effects}, _attempts, _duration_ms} ->
+        Config.terminal_tool?(config, name)
+
+      {%PendingToolCall{name: name}, {:ok, _value}, _attempts, _duration_ms} ->
+        Config.terminal_tool?(config, name)
+
+      _other ->
+        false
+    end)
   end
 
   defp run_pending_tool_round(%State{} = state, owner, ref, %Config{} = config, context) do

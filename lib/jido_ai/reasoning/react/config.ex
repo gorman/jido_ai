@@ -59,6 +59,7 @@ defmodule Jido.AI.Reasoning.ReAct.Config do
               model: Zoi.any(description: "Resolved ReqLLM model input"),
               system_prompt: Zoi.string() |> Zoi.nullish(),
               tools: Zoi.map() |> Zoi.default(%{}),
+              terminal_tools: Zoi.list(Zoi.atom()) |> Zoi.default([]),
               request_transformer: Zoi.atom() |> Zoi.nullish(),
               pending_input_server: Zoi.any() |> Zoi.nullish(),
               max_iterations: Zoi.integer() |> Zoi.default(@default_max_iterations),
@@ -148,6 +149,7 @@ defmodule Jido.AI.Reasoning.ReAct.Config do
       model: resolved_model,
       system_prompt: normalize_optional_binary(get_opt(opts_map, :system_prompt, nil)),
       tools: tools,
+      terminal_tools: normalize_terminal_tools(get_opt(opts_map, :terminal_tools, [])),
       request_transformer: normalize_request_transformer(get_opt(opts_map, :request_transformer, nil)),
       pending_input_server: get_opt(opts_map, :pending_input_server, nil),
       max_iterations:
@@ -204,6 +206,23 @@ defmodule Jido.AI.Reasoning.ReAct.Config do
     |> Map.values()
     |> ToolAdapter.from_actions()
   end
+
+  @doc """
+  Whether a tool ends the run as soon as it executes successfully.
+
+  The ReAct loop otherwise only stops on an LLM response that requests no tools,
+  so a tool the model is instructed to call last still costs a full closing
+  round. Declaring it in `terminal_tools:` completes the run once its result is
+  on the event stream instead.
+  """
+  @spec terminal_tool?(t(), String.t()) :: boolean()
+  def terminal_tool?(%__MODULE__{terminal_tools: []}, _tool_name), do: false
+
+  def terminal_tool?(%__MODULE__{terminal_tools: modules}, tool_name) when is_binary(tool_name) do
+    Enum.any?(modules, &(tool_module_name(&1) == tool_name))
+  end
+
+  def terminal_tool?(%__MODULE__{}, _tool_name), do: false
 
   @doc """
   Returns the effective stream consumer timeout.
@@ -329,6 +348,20 @@ defmodule Jido.AI.Reasoning.ReAct.Config do
 
   defp normalize_optional_binary(value) when is_binary(value) and value != "", do: value
   defp normalize_optional_binary(_), do: nil
+
+  defp normalize_terminal_tools(modules) when is_list(modules) do
+    Enum.filter(modules, &(tool_module_name(&1) != nil))
+  end
+
+  defp normalize_terminal_tools(_), do: []
+
+  defp tool_module_name(module) when is_atom(module) and not is_nil(module) do
+    if Code.ensure_loaded?(module) and function_exported?(module, :name, 0) do
+      module.name()
+    end
+  end
+
+  defp tool_module_name(_), do: nil
 
   defp normalize_request_transformer(request_transformer) do
     case RequestTransformer.validate(request_transformer) do

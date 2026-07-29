@@ -21,6 +21,9 @@ defmodule Jido.AI.Agent do
 
   - `:name` (required) - Agent name
   - `:tools` (required) - List of `Jido.Action` modules to use as tools
+  - `:terminal_tools` - Subset of `:tools` that ends the turn on success. Once
+    such a tool runs, the reasoning loop completes instead of spending another
+    LLM round to reach a response with no tool calls (default: `[]`)
   - `:description` - Agent description (default: "AI agent \#{name}")
   - `:tags` - Agent tags for discovery/classification (default: `[]`)
   - `:system_prompt` - Custom system prompt for the LLM
@@ -297,6 +300,14 @@ defmodule Jido.AI.Agent do
         mod when is_atom(mod) -> mod
       end)
 
+    terminal_tools =
+      opts
+      |> Keyword.get(:terminal_tools, [])
+      |> Enum.map(fn
+        {:__aliases__, _, _} = alias_ast -> Macro.expand(alias_ast, __CALLER__)
+        mod when is_atom(mod) -> mod
+      end)
+
     description = Keyword.get(opts, :description, "AI agent #{name}")
     tags = Keyword.get(opts, :tags, [])
     system_prompt_raw = Keyword.get(opts, :system_prompt)
@@ -410,6 +421,7 @@ defmodule Jido.AI.Agent do
     strategy_opts =
       [
         tools: tools,
+        terminal_tools: terminal_tools,
         model: model,
         streaming: streaming,
         max_iterations: max_iterations,
