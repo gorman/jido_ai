@@ -1876,6 +1876,7 @@ defmodule Jido.AI.Reasoning.ReAct.Strategy do
   defp runtime_kind_from_string("tool_started"), do: :tool_started
   defp runtime_kind_from_string("tool_completed"), do: :tool_completed
   defp runtime_kind_from_string("input_injected"), do: :input_injected
+  defp runtime_kind_from_string("stream_activity"), do: :stream_activity
   defp runtime_kind_from_string("checkpoint"), do: :checkpoint
   defp runtime_kind_from_string("request_completed"), do: :request_completed
   defp runtime_kind_from_string("request_failed"), do: :request_failed

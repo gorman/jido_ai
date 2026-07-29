@@ -579,6 +579,7 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   after
     Process.delete(stream_state_key(ref))
     Process.delete(stream_signal_key(ref))
+    Process.delete(stream_activity_key(ref))
   end
 
   defp consume_generate(%State{} = state, %Config{} = _config, response, model) do
@@ -1412,6 +1413,7 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
 
   defp stream_state_key(ref), do: {__MODULE__, :stream_state, ref}
   defp stream_signal_key(ref), do: {__MODULE__, :stream_signal, ref}
+  defp stream_activity_key(ref), do: {__MODULE__, :stream_activity, ref}
 
   defp note_stream_chunk_activity(chunk, state_key, owner, ref, trace_cfg, heartbeat_interval_ms) do
     case current_stream_state(state_key, nil) do
@@ -1419,11 +1421,13 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
       _ -> :ok
     end
 
+    visible? = visible_chunk?(chunk, trace_cfg)
+
     last_owner_signal_ms = Process.get(stream_signal_key(ref), monotonic_ms())
 
     last_owner_signal_ms =
       maybe_note_owner_signal(
-        visible_chunk?(chunk, trace_cfg),
+        visible?,
         owner,
         ref,
         last_owner_signal_ms,
@@ -1431,6 +1435,49 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
       )
 
     Process.put(stream_signal_key(ref), last_owner_signal_ms)
+    maybe_emit_stream_activity(visible?, state_key, owner, ref)
+    :ok
+  end
+
+  # How often a silent-but-working stream announces itself as an event.
+  # `notify_progress/2` already keeps THIS process's receive alive, but it is a
+  # bare message — it never becomes a stream element, so a consumer watching the
+  # event stream for inactivity (see `Request.Stream.events/2`) cannot see it and
+  # will halt a turn that is making progress. Chunks a server tool absorbs
+  # (streaming tool input, provider result blocks, keepalives/pings) are exactly
+  # that case: minutes of real work, zero events. This interval is deliberately
+  # much shorter than any consumer timeout so it stays useful if one is tightened.
+  @stream_activity_interval_ms 15_000
+
+  # A visible chunk becomes an `:llm_delta` on its own, so it only restarts the
+  # clock; silence after it is what needs announcing.
+  defp maybe_emit_stream_activity(true, _state_key, _owner, ref) do
+    Process.put(stream_activity_key(ref), monotonic_ms())
+    :ok
+  end
+
+  defp maybe_emit_stream_activity(false, state_key, owner, ref) do
+    current_ms = monotonic_ms()
+    last_ms = Process.get(stream_activity_key(ref))
+
+    if is_nil(last_ms) or current_ms - last_ms >= @stream_activity_interval_ms do
+      emit_stream_activity(state_key, owner, ref)
+      Process.put(stream_activity_key(ref), current_ms)
+    end
+
+    :ok
+  end
+
+  defp emit_stream_activity(state_key, owner, ref) do
+    update_stream_state(state_key, fn
+      %State{} = current_state ->
+        {next_state, _event} = emit_event(current_state, owner, ref, :stream_activity, %{})
+        next_state
+
+      other ->
+        other
+    end)
+
     :ok
   end
 

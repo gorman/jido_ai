@@ -8,7 +8,7 @@ defmodule Jido.AI.Reasoning.ReAct.Event do
 
   alias Jido.AI.Runtime.Event, as: RuntimeEvent
 
-  @kind_values RuntimeEvent.kinds() ++ [:input_injected]
+  @kind_values RuntimeEvent.kinds() ++ [:input_injected, :stream_activity]
 
   @type t :: %__MODULE__{
           id: String.t(),

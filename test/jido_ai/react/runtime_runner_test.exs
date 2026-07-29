@@ -987,6 +987,35 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerTest do
     assert request_completed.data.result == "Hello from stream"
   end
 
+  test "announces a silent-but-working stream as an event a consumer can see" do
+    # A server tool streaming its input produces only absorbed chunks (keepalives
+    # / pings), for minutes. `notify_progress/2` keeps this process's own receive
+    # alive but never reaches the event stream, so a consumer watching that stream
+    # for inactivity would halt a turn that is working. These chunks must surface
+    # as events.
+    keepalives = for _ <- 1..3, do: ReqLLM.StreamChunk.meta(%{keepalive?: true})
+
+    Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
+      {:ok,
+       responses_stream_response(
+         delayed_stream(keepalives, 2),
+         %{finish_reason: :stop, usage: %{input_tokens: 1, output_tokens: 1}},
+         model
+       )}
+    end)
+
+    config = Config.new(%{model: :capable, tools: %{}, capture_deltas?: false})
+
+    events = ReAct.stream("Crunch the attached file", config) |> Enum.to_list()
+
+    assert Enum.any?(events, &(&1.kind == :stream_activity)),
+           "expected absorbed chunks to surface as :stream_activity events, got: " <>
+             inspect(Enum.map(events, & &1.kind))
+
+    # Throttled: the burst announces itself once, not once per chunk.
+    assert Enum.count(events, &(&1.kind == :stream_activity)) == 1
+  end
+
   test "throttles synthetic progress for dense hidden chunk streams" do
     parent = self()
     hidden_text_chunks = for _ <- 1..200, do: ReqLLM.StreamChunk.text("x")
