@@ -1820,6 +1820,13 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   defp invalid_blank_terminal_finish_reason?(_reason), do: true
 
   defp fail_run(%State{} = state, owner, ref, %Config{} = config, reason, error_type) do
+    # A cancelled stream fails on its way out, so the error can get here with the
+    # cancel still unread: `request_stream_cancel/2` tears the stream down before it
+    # signals this process. Check once more before calling it a failure, otherwise a
+    # deliberate stop is reported as one. The cancel path does its own sealing, so
+    # this has to come first.
+    check_cancel!(state, ref)
+
     seal_pending_input_server(config)
 
     state
