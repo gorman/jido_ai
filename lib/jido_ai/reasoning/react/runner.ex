@@ -1377,6 +1377,10 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   defp visible_chunk?(%ReqLLM.StreamChunk{type: :content, text: text}, trace_cfg), do: delta_captured?(text, trace_cfg)
   defp visible_chunk?(%ReqLLM.StreamChunk{type: :thinking, text: text}, trace_cfg), do: delta_captured?(text, trace_cfg)
   defp visible_chunk?(%ReqLLM.StreamChunk{type: :tool_call}, trace_cfg), do: trace_cfg[:capture_deltas?] == true
+
+  defp visible_chunk?(%ReqLLM.StreamChunk{type: :meta, metadata: %{tool_call_args: _}}, trace_cfg),
+    do: trace_cfg[:capture_deltas?] == true
+
   defp visible_chunk?(_chunk, _trace_cfg), do: false
 
   defp delta_captured?(text, trace_cfg), do: trace_cfg[:capture_deltas?] == true and is_binary(text) and text != ""
@@ -1386,6 +1390,7 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
     |> Keyword.put(:on_chunk, fn chunk ->
       note_stream_chunk_activity(chunk, state_key, owner, ref, trace_cfg, heartbeat_interval_ms)
       maybe_emit_server_tool_started(chunk, state_key, owner, ref, model)
+      maybe_emit_tool_args_delta(chunk, state_key, owner, ref, trace_cfg, model)
     end)
     |> maybe_put_stream_callback(trace_cfg, :on_result, fn text ->
       emit_stream_delta(state_key, owner, ref, :content, text, model)
@@ -1420,6 +1425,31 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   end
 
   defp maybe_emit_server_tool_started(_chunk, _state_key, _owner, _ref, _model), do: :ok
+
+  # A tool call's arguments stream as raw JSON fragments and, until now, reached
+  # no consumer at all: they are folded into the accumulator and surface only
+  # once the whole call is built. On a large emission that is tens of seconds of
+  # a working stream with nothing to show for it. Forward each fragment under
+  # its own chunk type so a consumer can report what the model has emitted so
+  # far; consumers that don't want deltas are unaffected (same
+  # `capture_deltas?` gate as the other delta callbacks).
+  defp maybe_emit_tool_args_delta(
+         %ReqLLM.StreamChunk{type: :meta, metadata: %{tool_call_args: %{fragment: fragment}}},
+         state_key,
+         owner,
+         ref,
+         trace_cfg,
+         model
+       )
+       when is_binary(fragment) do
+    if trace_cfg[:capture_deltas?] == true do
+      emit_stream_delta(state_key, owner, ref, :tool_args, fragment, model)
+    else
+      :ok
+    end
+  end
+
+  defp maybe_emit_tool_args_delta(_chunk, _state_key, _owner, _ref, _trace_cfg, _model), do: :ok
 
   defp emit_stream_delta(_state_key, _owner, _ref, _chunk_type, text, _model) when text in [nil, ""], do: :ok
 
