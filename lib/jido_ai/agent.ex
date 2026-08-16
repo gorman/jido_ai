@@ -31,6 +31,9 @@ defmodule Jido.AI.Agent do
   - `:max_iterations` - Maximum reasoning iterations (default: 10)
   - `:max_tokens` - Maximum tokens per LLM response (default: `4096`)
   - `:streaming` - Whether to stream LLM responses (default: `true`)
+  - `:max_stream_resumes` - How many times one run may resume a turn whose
+    stream died in transport, replaying what the dead stream produced instead
+    of failing the run (default: 2; `0` disables)
   - `:request_policy` - Request concurrency policy (default: `:reject`)
   - `:tool_timeout_ms` - Per-attempt tool execution timeout in ms (default: 15_000)
   - `:tool_max_retries` - Number of retries for tool failures (default: 1)
@@ -341,6 +344,8 @@ defmodule Jido.AI.Agent do
     max_iterations = Keyword.get(opts, :max_iterations, @default_max_iterations)
     max_tokens = Keyword.get(opts, :max_tokens, @default_max_tokens)
     streaming = Keyword.get(opts, :streaming, true)
+    # nil keeps the runtime config's own default; see ReAct.Config.
+    max_stream_resumes = Keyword.get(opts, :max_stream_resumes)
     request_policy = Keyword.get(opts, :request_policy, :reject)
     tool_timeout_ms = Keyword.get(opts, :tool_timeout_ms, 15_000)
     tool_max_retries = Keyword.get(opts, :tool_max_retries, 1)
@@ -425,6 +430,7 @@ defmodule Jido.AI.Agent do
         model: model,
         streaming: streaming,
         max_iterations: max_iterations,
+        max_stream_resumes: max_stream_resumes,
         max_tokens: max_tokens,
         request_policy: request_policy,
         tool_timeout_ms: tool_timeout_ms,

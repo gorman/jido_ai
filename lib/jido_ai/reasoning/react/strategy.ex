@@ -65,6 +65,7 @@ defmodule Jido.AI.Reasoning.ReAct.Strategy do
           system_prompt: String.t(),
           model: String.t(),
           max_iterations: pos_integer(),
+          max_stream_resumes: non_neg_integer() | nil,
           max_tokens: pos_integer(),
           streaming: boolean(),
           base_tool_context: map(),
@@ -1943,6 +1944,7 @@ defmodule Jido.AI.Reasoning.ReAct.Strategy do
       terminal_tools: config[:terminal_tools],
       request_transformer: request_transformer,
       max_iterations: max_iterations,
+      max_stream_resumes: config[:max_stream_resumes],
       max_tokens: config[:max_tokens],
       streaming: config[:streaming],
       stream_timeout_ms: stream_timeout_ms,
@@ -2239,6 +2241,7 @@ defmodule Jido.AI.Reasoning.ReAct.Strategy do
       system_prompt: normalize_system_prompt_opt(opts),
       model: resolved_model,
       max_iterations: Keyword.get(opts, :max_iterations, @default_max_iterations),
+      max_stream_resumes: Keyword.get(opts, :max_stream_resumes),
       max_tokens: Keyword.get(opts, :max_tokens, @default_max_tokens),
       streaming: Keyword.get(opts, :streaming, true),
       stream_receive_timeout_ms:
