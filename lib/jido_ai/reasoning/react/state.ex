@@ -20,6 +20,7 @@ defmodule Jido.AI.Reasoning.ReAct.State do
               llm_call_id: Zoi.string() |> Zoi.nullish(),
               llm_response_id: Zoi.string() |> Zoi.nullish(),
               container_id: Zoi.string() |> Zoi.nullish(),
+              stream_resumes: Zoi.integer() |> Zoi.default(0),
               context: Zoi.any(),
               active_tools: Zoi.map() |> Zoi.default(%{}),
               pending_tool_calls: Zoi.list(PendingToolCall.schema()) |> Zoi.default([]),
@@ -104,6 +105,7 @@ defmodule Jido.AI.Reasoning.ReAct.State do
         llm_call_id: Map.get(map, :llm_call_id, Map.get(map, "llm_call_id")),
         llm_response_id: Map.get(map, :llm_response_id, Map.get(map, "llm_response_id")),
         container_id: Map.get(map, :container_id, Map.get(map, "container_id")),
+        stream_resumes: Map.get(map, :stream_resumes, Map.get(map, "stream_resumes", 0)) || 0,
         context: context,
         active_tools: Map.get(map, :active_tools, Map.get(map, "active_tools", %{})) || %{},
         pending_tool_calls: restore_pending(Map.get(map, :pending_tool_calls, Map.get(map, "pending_tool_calls", []))),
@@ -141,6 +143,7 @@ defmodule Jido.AI.Reasoning.ReAct.State do
       llm_call_id: state.llm_call_id,
       llm_response_id: state.llm_response_id,
       container_id: state.container_id,
+      stream_resumes: state.stream_resumes,
       context: state.context,
       active_tools: state.active_tools,
       pending_tool_calls: state.pending_tool_calls,
@@ -206,6 +209,17 @@ defmodule Jido.AI.Reasoning.ReAct.State do
   @spec put_container_id(t(), String.t() | nil) :: t()
   def put_container_id(%__MODULE__{} = state, container_id) do
     %{state | container_id: container_id, updated_at_ms: now_ms()}
+  end
+
+  @doc """
+  Counts one more resume of a turn whose stream died mid-flight.
+
+  Bounded by the runtime config: a provider that keeps dropping the connection
+  must fail the run instead of looping.
+  """
+  @spec inc_stream_resumes(t()) :: t()
+  def inc_stream_resumes(%__MODULE__{} = state) do
+    %{state | stream_resumes: state.stream_resumes + 1, updated_at_ms: now_ms()}
   end
 
   @doc """

@@ -1,6 +1,7 @@
 defmodule Jido.AI.Reasoning.ReAct.StreamResumeTest do
   use ExUnit.Case, async: true
 
+  alias Jido.AI.Reasoning.ReAct.Config
   alias Jido.AI.Reasoning.ReAct.StreamResume
   alias ReqLLM.StreamChunk
 
@@ -29,6 +30,18 @@ defmodule Jido.AI.Reasoning.ReAct.StreamResumeTest do
       model: model,
       context: ReqLLM.Context.new([])
     }
+  end
+
+  describe "the resume budget" do
+    test "allows two resumes per run by default" do
+      assert Config.new(%{model: :capable}).max_stream_resumes == 2
+    end
+
+    test "takes an override, and treats an unset override as the default" do
+      assert Config.new(%{model: :capable, max_stream_resumes: 5}).max_stream_resumes == 5
+      assert Config.new(%{model: :capable, max_stream_resumes: 0}).max_stream_resumes == 0
+      assert Config.new(%{model: :capable, max_stream_resumes: nil}).max_stream_resumes == 2
+    end
   end
 
   describe "truncate_at_last_tool_result/1" do
