@@ -4,6 +4,7 @@ Mimic.copy(ReqLLM.Embedding)
 Mimic.copy(ReqLLM.Providers.OpenAI)
 Mimic.copy(ReqLLM.Providers.OpenAICodex)
 Mimic.copy(ReqLLM.StreamResponse)
+Mimic.copy(ReqLLM.Provider.ResponseBuilder)
 Mimic.copy(Jido.AgentServer)
 
 ExUnit.start(exclude: [:flaky], capture_log: true)

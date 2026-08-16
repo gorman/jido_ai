@@ -9,7 +9,7 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   alias Jido.AI.Output
   alias Jido.AI.PendingInputServer
   alias Jido.AI.Query
-  alias Jido.AI.Reasoning.ReAct.{Config, Event, PendingToolCall, State, Token, ToolSelection}
+  alias Jido.AI.Reasoning.ReAct.{Config, Event, PendingToolCall, State, StreamResume, Token, ToolSelection}
   alias Jido.AI.Effects
   alias Jido.AI.Context, as: AIContext
   alias Jido.AI.Error
@@ -200,6 +200,11 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
               {:paused, state} ->
                 run_loop(state, owner, ref, config, context)
 
+              # The stream died in transport and the turn is being resumed;
+              # whatever survived is already appended, so ask again.
+              {:resume, state} ->
+                run_loop(state, owner, ref, config, context)
+
               {:tool_calls, state, tool_calls} ->
                 prev_signature = Map.get(state, :__prev_tool_signature__)
                 current_signature = tool_call_signature(tool_calls)
@@ -305,6 +310,9 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
           else
             run_llm_outcome(state, owner, ref, config, turn, call_id)
           end
+
+        {:resume, state, partial_turn} ->
+          handle_stream_resume(state, owner, ref, config, partial_turn)
 
         {:error, state, reason, error_type} ->
           {:error, state, reason, error_type}
@@ -418,6 +426,37 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
     {state, _token} = emit_checkpoint(state, owner, ref, config, :after_llm)
 
     {:paused, state}
+  end
+
+  # The stream died in transport and the run is resuming the turn. This is the
+  # same request shape as a pause_turn continuation: the partial assistant
+  # content — provider-native blocks in the order they arrived, cut at the last
+  # completed tool result — goes back with the container id and no new user or
+  # tool message, so the model carries on from the boundary. No `llm_completed`
+  # event: the turn did not complete, and the content going back is a fragment
+  # the model is about to extend.
+  defp handle_stream_resume(%State{} = state, owner, ref, %Config{} = config, %Turn{} = turn) do
+    context_opts = assistant_context_opts(turn) ++ [content_parts: turn.content_parts]
+
+    state =
+      state.context
+      |> AIContext.append_assistant(turn.text, nil, context_opts)
+      |> then(&%{state | context: &1})
+      |> State.put_container_id(resumed_container_id(turn, state))
+      |> State.inc_iteration()
+
+    {state, _token} = emit_checkpoint(state, owner, ref, config, :after_llm)
+
+    {:resume, state}
+  end
+
+  # Nothing completed before the connection died, so there is no partial turn to
+  # replay: the next request repeats this turn with the context untouched.
+  defp handle_stream_resume(%State{} = state, owner, ref, %Config{} = config, nil) do
+    state = State.inc_iteration(state)
+    {state, _token} = emit_checkpoint(state, owner, ref, config, :after_llm)
+
+    {:resume, state}
   end
 
   defp build_turn_request(%State{} = state, %Config{} = config, runtime_context) do
@@ -547,6 +586,7 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
 
         case consume_stream(state, owner, ref, config, stream_response, model) do
           {:ok, updated_state, turn, response_id} -> {:ok, updated_state, turn, response_id}
+          {:resume, updated_state, partial_turn} -> {:resume, updated_state, partial_turn}
           {:error, updated_state, reason} -> {:error, updated_state, reason, :llm_stream}
         end
 
@@ -571,9 +611,11 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
     trace_cfg = config.trace
     state_key = stream_state_key(ref)
     heartbeat_interval_ms = progress_interval_ms(config)
+    started_ms = monotonic_ms()
 
     Process.put(state_key, state)
-    Process.put(stream_signal_key(ref), monotonic_ms())
+    Process.put(stream_signal_key(ref), started_ms)
+    arm_chunk_capture(ref, state, config)
 
     case ReqLLM.StreamResponse.process_stream(
            stream_response,
@@ -590,7 +632,13 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
         {:ok, current_state, turn, extract_response_id(response)}
 
       {:error, reason} ->
-        {:error, current_stream_state(state_key, state), reason}
+        current_stream_state(state_key, state)
+        |> maybe_resume_stream(config, reason, %{
+          ref: ref,
+          model: model,
+          stream_response: stream_response,
+          started_ms: started_ms
+        })
     end
   rescue
     e ->
@@ -598,6 +646,75 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   after
     Process.delete(stream_state_key(ref))
     Process.delete(stream_signal_key(ref))
+    Process.delete(stream_chunks_key(ref))
+  end
+
+  # The chunks the stream has already delivered, kept caller-side so they
+  # survive the mid-stream raise that unwinds the provider's own accumulator.
+  # Only armed while a resume is still available, since a long turn holds every
+  # chunk it produced.
+  defp arm_chunk_capture(ref, %State{} = state, %Config{} = config) do
+    if state.stream_resumes < config.max_stream_resumes do
+      Process.put(stream_chunks_key(ref), [])
+    end
+
+    :ok
+  end
+
+  defp capture_stream_chunk(chunks_key, chunk) do
+    case Process.get(chunks_key) do
+      chunks when is_list(chunks) -> Process.put(chunks_key, [chunk | chunks])
+      _ -> nil
+    end
+
+    :ok
+  end
+
+  defp captured_chunks(ref) do
+    case Process.get(stream_chunks_key(ref)) do
+      chunks when is_list(chunks) -> Enum.reverse(chunks)
+      _ -> []
+    end
+  end
+
+  # A stream killed in transport says nothing about the turn: the provider kept
+  # working, and a code-execution container outlives the connection. Replaying
+  # the part of the assistant message that made it across — truncated to its
+  # last completed tool result — continues the turn instead of failing the run.
+  defp maybe_resume_stream(%State{} = state, %Config{} = config, reason, ctx) do
+    if state.stream_resumes < config.max_stream_resumes and StreamResume.resumable_error?(reason) do
+      resume_stream(state, ctx)
+    else
+      {:error, state, reason}
+    end
+  end
+
+  defp resume_stream(%State{} = state, ctx) do
+    state = State.inc_stream_resumes(state)
+    chunks = captured_chunks(ctx.ref)
+
+    case StreamResume.partial_turn(chunks, ctx.stream_response, Jido.AI.model_label(ctx.model)) do
+      {:ok, turn, blocks_kept} ->
+        log_stream_resume(state, ctx, blocks_kept, resumed_container_id(turn, state))
+        {:resume, state, turn}
+
+      :none ->
+        log_stream_resume(state, ctx, 0, state.container_id)
+        {:resume, state, nil}
+    end
+  end
+
+  defp resumed_container_id(%Turn{container_id: container_id}, _state) when is_binary(container_id),
+    do: container_id
+
+  defp resumed_container_id(_turn, %State{} = state), do: state.container_id
+
+  defp log_stream_resume(%State{} = state, ctx, blocks_kept, container_id) do
+    Logger.info(
+      "react stream_resume: resume=#{state.stream_resumes} run_id=#{state.run_id} " <>
+        "stream_seconds=#{div(monotonic_ms() - ctx.started_ms, 1000)} blocks_kept=#{blocks_kept} " <>
+        "container=#{is_binary(container_id)}"
+    )
   end
 
   defp consume_generate(%State{} = state, %Config{} = _config, response, model) do
@@ -1381,8 +1498,11 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   defp delta_captured?(text, trace_cfg), do: trace_cfg[:capture_deltas?] == true and is_binary(text) and text != ""
 
   defp stream_process_opts(owner, ref, trace_cfg, state_key, heartbeat_interval_ms, model) do
+    chunks_key = stream_chunks_key(ref)
+
     []
     |> Keyword.put(:on_chunk, fn chunk ->
+      capture_stream_chunk(chunks_key, chunk)
       note_stream_chunk_activity(chunk, state_key, owner, ref, trace_cfg, heartbeat_interval_ms)
       maybe_emit_server_tool_started(chunk, state_key, owner, ref, model)
     end)
@@ -1455,6 +1575,7 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
 
   defp stream_state_key(ref), do: {__MODULE__, :stream_state, ref}
   defp stream_signal_key(ref), do: {__MODULE__, :stream_signal, ref}
+  defp stream_chunks_key(ref), do: {__MODULE__, :stream_chunks, ref}
 
   defp note_stream_chunk_activity(chunk, state_key, owner, ref, trace_cfg, heartbeat_interval_ms) do
     case current_stream_state(state_key, nil) do
