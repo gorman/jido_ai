@@ -1884,6 +1884,55 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerTest do
            end)
   end
 
+  test "a stream that errors while a cancel is queued ends the run as cancelled" do
+    consumer = self()
+
+    # `request_stream_cancel/2` tears the stream down before it signals the
+    # coordinator, so the stream error can reach the coordinator while the
+    # cancel is still sitting unread in its mailbox. This stub reproduces that
+    # ordering exactly: fail only once the cancel has been queued.
+    canceller =
+      spawn_link(fn ->
+        receive do
+          :stream_running -> send(consumer, {:react_stream_cancel, :user_stop})
+        after
+          2_000 -> :ok
+        end
+      end)
+
+    Mimic.stub(ReqLLM.StreamResponse, :process_stream, fn _stream_response, _opts ->
+      send(canceller, :stream_running)
+
+      wait_until(
+        fn ->
+          {:messages, messages} = Process.info(self(), :messages)
+          Enum.any?(messages, &match?({:react_cancel, _ref, :user_stop}, &1))
+        end,
+        2_000
+      )
+
+      {:error, :closed}
+    end)
+
+    Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
+      {:ok,
+       responses_stream_response(
+         [ReqLLM.StreamChunk.text("partial")],
+         %{finish_reason: :stop, usage: %{input_tokens: 1, output_tokens: 1}},
+         model
+       )}
+    end)
+
+    config = Config.new(%{model: :capable, tools: %{}})
+
+    events = ReAct.stream("stop me", config) |> Enum.to_list()
+
+    refute Enum.any?(events, &(&1.kind == :request_failed))
+
+    cancelled = Enum.find(events, &(&1.kind == :request_cancelled))
+    assert cancelled.data.reason == :user_stop
+  end
+
   describe "stream_timeout" do
     test "default derives from tool_exec.timeout_ms + 60s" do
       config = Config.new(%{model: :capable, tool_timeout_ms: 120_000})
