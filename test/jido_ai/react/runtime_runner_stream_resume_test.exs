@@ -76,6 +76,7 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerStreamResumeTest do
 
     assistant = Enum.filter(second, &match?(%{role: :assistant}, &1))
     assert [%{content: [%ContentPart{type: :text, text: "kept "}]}] = assistant
+    assert %{role: :user, content: "continue"} = List.last(second)
   end
 
   test "hands the builder the chunks truncated at the last tool result, in arrival order" do
