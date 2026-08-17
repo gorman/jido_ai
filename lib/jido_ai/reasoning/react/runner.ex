@@ -26,6 +26,11 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   # calls with identical arguments on consecutive iterations.
   @cycle_warning "You already called the same tool(s) with identical parameters in the previous iteration and got the same results. Do NOT repeat the same calls. Either use the results you already have to form a final answer, or try a different approach."
 
+  # Trails the replayed assistant content on pause_turn and stream-resume
+  # continuations, so the conversation never ends with an assistant message
+  # (gateways without assistant-prefill support reject that shape).
+  @continuation_message "continue"
+
   @type stream_opt ::
           {:request_id, String.t()}
           | {:run_id, String.t()}
@@ -390,9 +395,12 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
 
   # The provider paused the turn mid-execution (Anthropic's pause_turn during
   # server-tool use). Append the paused assistant content — including the
-  # provider-native blocks the resume depends on — and loop for another LLM
-  # call with no new user or tool message, so the model continues its own
-  # turn. Counts against max_iterations like any other iteration.
+  # provider-native blocks the resume depends on — plus a minimal user message,
+  # and loop for another LLM call. The trailing user message exists because
+  # some gateways (Azure Foundry) reject a conversation that ends with an
+  # assistant message ("does not support assistant message prefill"); the
+  # container id, not the message shape, is what carries the sandbox state
+  # forward. Counts against max_iterations like any other iteration.
   defp handle_paused_turn(%State{} = state, owner, ref, %Config{} = config, turn, call_id) do
     {state, _} =
       emit_event(
@@ -420,6 +428,7 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
     state =
       state.context
       |> AIContext.append_assistant(turn.text, nil, context_opts)
+      |> AIContext.append_user(@continuation_message)
       |> then(&%{state | context: &1})
       |> State.inc_iteration()
 
@@ -431,16 +440,17 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   # The stream died in transport and the run is resuming the turn. This is the
   # same request shape as a pause_turn continuation: the partial assistant
   # content — provider-native blocks in the order they arrived, cut at the last
-  # completed tool result — goes back with the container id and no new user or
-  # tool message, so the model carries on from the boundary. No `llm_completed`
-  # event: the turn did not complete, and the content going back is a fragment
-  # the model is about to extend.
+  # completed tool result — goes back with the container id and the same
+  # minimal user message (see handle_paused_turn), so the model carries on
+  # from the boundary. No `llm_completed` event: the turn did not complete,
+  # and the content going back is a fragment the model is about to extend.
   defp handle_stream_resume(%State{} = state, owner, ref, %Config{} = config, %Turn{} = turn) do
     context_opts = assistant_context_opts(turn) ++ [content_parts: turn.content_parts]
 
     state =
       state.context
       |> AIContext.append_assistant(turn.text, nil, context_opts)
+      |> AIContext.append_user(@continuation_message)
       |> then(&%{state | context: &1})
       |> State.put_container_id(resumed_container_id(turn, state))
       |> State.inc_iteration()
