@@ -16,24 +16,21 @@ defmodule Jido.AI.Reasoning.ReAct.StreamResume do
     * Blocks may NOT be REORDERED. A thinking block that moves relative to a
       non-text block is rejected ("`thinking` blocks ... cannot be modified").
 
-  So the captured chunk list is truncated at the last completed
-  code-execution result block and replayed in arrival order — never re-bucketed
-  by type. Everything after that boundary (a half-written text block, a
-  thinking block whose signature never arrived) is dropped, and the provider
-  regenerates it.
+  So the captured chunk list is truncated at the last completed server-tool
+  result block and replayed in arrival order — never re-bucketed by type.
+  Everything after that boundary (a half-written text block, a thinking block
+  whose signature never arrived) is dropped, and the provider regenerates it.
   """
 
   alias Jido.AI.Turn
   alias ReqLLM.StreamChunk
 
-  # The code-execution tool answers under three result types, one per sub-tool.
-  # Each arrives as a single complete block, so seeing one in the chunk list is
-  # proof the block closed — there is no partial form to guard against.
-  @boundary_block_types [
-    "code_execution_tool_result",
-    "bash_code_execution_tool_result",
-    "text_editor_code_execution_tool_result"
-  ]
+  # Every server tool answers under its own result type, all of them ending in
+  # `_tool_result`: the three code-execution sub-tools, web search, and whatever
+  # the provider adds next. Each arrives as a single complete block, so seeing
+  # one in the chunk list is proof the block closed — there is no partial form
+  # to guard against.
+  @boundary_block_suffix "_tool_result"
 
   # Matched by name rather than by struct so this module keeps working without a
   # compile-time dependency on the HTTP client's error structs.
@@ -57,7 +54,7 @@ defmodule Jido.AI.Reasoning.ReAct.StreamResume do
   def resumable_error?(error), do: closed_transport?(error, @max_cause_depth)
 
   @doc """
-  Truncates a captured chunk list to its last complete code-execution result.
+  Truncates a captured chunk list to its last complete server-tool result.
 
   Returns `{:ok, chunks, blocks_kept}` with the chunks up to and including that
   block, or `:no_boundary` when the stream died before any result arrived.
@@ -120,8 +117,9 @@ defmodule Jido.AI.Reasoning.ReAct.StreamResume do
     end)
   end
 
-  defp boundary?(%StreamChunk{type: :meta, metadata: %{provider_block: %{"type" => type}}}),
-    do: type in @boundary_block_types
+  defp boundary?(%StreamChunk{type: :meta, metadata: %{provider_block: %{"type" => type}}})
+       when is_binary(type),
+       do: String.ends_with?(type, @boundary_block_suffix)
 
   defp boundary?(_chunk), do: false
 

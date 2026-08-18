@@ -72,14 +72,21 @@ defmodule Jido.AI.Reasoning.ReAct.StreamResumeTest do
       assert StreamResume.truncate_at_last_tool_result([]) == :no_boundary
     end
 
-    test "accepts every code-execution result type" do
-      for type <- ~w(code_execution_tool_result bash_code_execution_tool_result text_editor_code_execution_tool_result) do
+    test "accepts every server-tool result type" do
+      types = ~w(
+        code_execution_tool_result
+        bash_code_execution_tool_result
+        text_editor_code_execution_tool_result
+        web_search_tool_result
+      )
+
+      for type <- types do
         assert {:ok, _kept, 1} = StreamResume.truncate_at_last_tool_result([block(type, "id"), StreamChunk.text("x")])
       end
     end
 
-    test "does not cut at other server-tool results" do
-      chunks = [tool_use("srvtoolu_1"), block("web_search_tool_result", "srvtoolu_1")]
+    test "does not cut at a block that is not a result" do
+      chunks = [tool_use("srvtoolu_1"), block("web_search_result", "srvtoolu_1")]
 
       assert StreamResume.truncate_at_last_tool_result(chunks) == :no_boundary
     end

@@ -110,6 +110,30 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerStreamResumeTest do
            ]
   end
 
+  test "cuts the replay after a bash result and drops the tool use still in flight" do
+    Mimic.stub(ReqLLM.Provider.ResponseBuilder, :for_model, fn _model -> ForkResponseBuilder end)
+
+    chunks = [
+      tool_use_chunk("srvtoolu_1", "bash_code_execution"),
+      tool_result_chunk("srvtoolu_1", "bash_code_execution_tool_result"),
+      tool_use_chunk("srvtoolu_2", "bash_code_execution")
+    ]
+
+    stub_stream_text(fn model, _opts -> dying_response(chunks, model) end)
+
+    assert completed_result(run("build the deck")) == "Second stream answer"
+    assert_receive {:rebuilt, rebuilt}
+    assert rebuilt == Enum.take(chunks, 2)
+
+    assert_receive {:messages, 2, second}
+    assistant = Enum.find(second, &match?(%{role: :assistant}, &1))
+
+    assert Enum.map(assistant.content, & &1.data["type"]) == [
+             "server_tool_use",
+             "bash_code_execution_tool_result"
+           ]
+  end
+
   test "threads the container id from the partial turn into the resumed request" do
     Mimic.stub(ReqLLM.Provider.ResponseBuilder, :for_model, fn _model -> ForkResponseBuilder end)
 
@@ -248,16 +272,16 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerStreamResumeTest do
     }
   end
 
-  defp tool_use_chunk(id) do
+  defp tool_use_chunk(id, name \\ "code_execution") do
     StreamChunk.meta(%{
-      provider_block: %{"type" => "server_tool_use", "id" => id, "name" => "code_execution"},
+      provider_block: %{"type" => "server_tool_use", "id" => id, "name" => name},
       provider: :anthropic
     })
   end
 
-  defp tool_result_chunk(id) do
+  defp tool_result_chunk(id, type \\ "code_execution_tool_result") do
     StreamChunk.meta(%{
-      provider_block: %{"type" => "code_execution_tool_result", "tool_use_id" => id},
+      provider_block: %{"type" => type, "tool_use_id" => id},
       provider: :anthropic
     })
   end

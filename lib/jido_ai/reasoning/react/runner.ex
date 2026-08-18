@@ -396,11 +396,12 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   # The provider paused the turn mid-execution (Anthropic's pause_turn during
   # server-tool use). Append the paused assistant content — including the
   # provider-native blocks the resume depends on — plus a minimal user message,
-  # and loop for another LLM call. The trailing user message exists because
-  # some gateways (Azure Foundry) reject a conversation that ends with an
-  # assistant message ("does not support assistant message prefill"); the
-  # container id, not the message shape, is what carries the sandbox state
-  # forward. Counts against max_iterations like any other iteration.
+  # and loop for another LLM call. The trailing user message exists because some
+  # gateways (Azure Foundry) reject a conversation that ends with an assistant
+  # message ("does not support assistant message prefill"); the container id,
+  # not the message shape, is what carries the sandbox state forward. See
+  # append_continuation/2 for the content that survives the replay. Counts
+  # against max_iterations like any other iteration.
   defp handle_paused_turn(%State{} = state, owner, ref, %Config{} = config, turn, call_id) do
     {state, _} =
       emit_event(
@@ -423,12 +424,9 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
         llm_call_id: call_id
       )
 
-    context_opts = assistant_context_opts(turn) ++ [content_parts: turn.content_parts]
-
     state =
       state.context
-      |> AIContext.append_assistant(turn.text, nil, context_opts)
-      |> AIContext.append_user(@continuation_message)
+      |> append_continuation(turn)
       |> then(&%{state | context: &1})
       |> State.inc_iteration()
 
@@ -445,12 +443,9 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   # from the boundary. No `llm_completed` event: the turn did not complete,
   # and the content going back is a fragment the model is about to extend.
   defp handle_stream_resume(%State{} = state, owner, ref, %Config{} = config, %Turn{} = turn) do
-    context_opts = assistant_context_opts(turn) ++ [content_parts: turn.content_parts]
-
     state =
       state.context
-      |> AIContext.append_assistant(turn.text, nil, context_opts)
-      |> AIContext.append_user(@continuation_message)
+      |> append_continuation(turn)
       |> then(&%{state | context: &1})
       |> State.put_container_id(resumed_container_id(turn, state))
       |> State.inc_iteration()
@@ -468,6 +463,68 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
 
     {:resume, state}
   end
+
+  # Replays an interrupted turn's assistant content and closes it with the
+  # minimal continuation message.
+  #
+  # The trailing user message makes the replayed assistant message a COMPLETED
+  # prior turn, and a completed turn must be self-contained: every server-tool
+  # use block needs its paired result block, or the API rejects the whole
+  # request ("`bash_code_execution` tool use with id `srvtoolu_...` was found
+  # without a corresponding `bash_code_execution_tool_result` block"). Under the
+  # old assistant-prefill shape an unpaired use was legal, because the turn was
+  # still being written; it is not legal any more.
+  #
+  # So the replay keeps the longest prefix of the content in which nothing is
+  # left open, and drops a use whose result was still in flight. Nothing is
+  # lost: the sandbox container keeps its state, and the model re-issues the
+  # command after the continuation message.
+  #
+  # Trimming can empty the content. An assistant message with no content is as
+  # invalid as an unpaired use, so when nothing survives — no blocks and no
+  # prose — the context is left untouched and the request simply repeats, the
+  # same behaviour as a resume with no partial turn to replay.
+  defp append_continuation(context, %Turn{} = turn) do
+    case {paired_content_parts(turn.content_parts), turn.text} do
+      {parts, text} when parts in [nil, []] and text in [nil, ""] ->
+        context
+
+      {parts, text} ->
+        opts = assistant_context_opts(turn) ++ [content_parts: parts]
+
+        context
+        |> AIContext.append_assistant(text, nil, opts)
+        |> AIContext.append_user(@continuation_message)
+    end
+  end
+
+  # A server-tool use is identified by its `srvtoolu_` id rather than its block
+  # type: Anthropic has already shipped several use and result types (web
+  # search, the three code-execution sub-tools) and pairing is by id in all of
+  # them.
+  defp paired_content_parts(parts) when is_list(parts) do
+    {kept, _open} =
+      parts
+      |> Enum.with_index(1)
+      |> Enum.reduce({0, MapSet.new()}, fn {part, position}, {kept, open} ->
+        open = track_pairing(part, open)
+
+        if MapSet.size(open) == 0, do: {position, open}, else: {kept, open}
+      end)
+
+    Enum.take(parts, kept)
+  end
+
+  defp paired_content_parts(parts), do: parts
+
+  defp track_pairing(%{type: :provider_block, data: %{"id" => "srvtoolu_" <> _ = id}}, open),
+    do: MapSet.put(open, id)
+
+  defp track_pairing(%{type: :provider_block, data: %{"type" => type, "tool_use_id" => id}}, open) do
+    if String.ends_with?(type, "_tool_result"), do: MapSet.delete(open, id), else: open
+  end
+
+  defp track_pairing(_part, open), do: open
 
   defp build_turn_request(%State{} = state, %Config{} = config, runtime_context) do
     base_request = %{
