@@ -347,7 +347,8 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
               content_parts: provider_content_parts(turn),
               tool_calls: turn.tool_calls,
               usage: turn.usage,
-              finish_reason: turn.finish_reason
+              finish_reason: turn.finish_reason,
+              container_id: turn.container_id
             },
             llm_call_id: call_id
           )
@@ -419,7 +420,8 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
           content_parts: turn.content_parts,
           tool_calls: turn.tool_calls,
           usage: turn.usage,
-          finish_reason: turn.finish_reason
+          finish_reason: turn.finish_reason,
+          container_id: turn.container_id
         },
         llm_call_id: call_id
       )
