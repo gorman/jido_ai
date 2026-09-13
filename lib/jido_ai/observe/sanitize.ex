@@ -7,6 +7,10 @@ defmodule Jido.AI.Observe.Sanitize do
 
   The transport profile preserves more payload detail while converting arbitrary
   terms into bounded JSON-safe data.
+
+  Both profiles are bounded twice: by `:max_depth` for one path down the payload,
+  and by `:max_bytes` for the payload as a whole. The walk counts the bytes it
+  emits, so a payload built from shared subterms stops before it is expanded.
   """
 
   @sensitive_exact_keys MapSet.new([
@@ -34,6 +38,15 @@ defmodule Jido.AI.Observe.Sanitize do
   @redacted "[REDACTED]"
   @truncated_key :__jido_ai_truncated__
 
+  # Approximate JSON cost of each emitted node, charged while the walk runs.
+  # Exact byte counts are not necessary: the budget only has to stop growth
+  # before the expanded tree is built.
+  @scalar_cost 8
+  @quote_cost 2
+  @key_cost 4
+  @container_cost 2
+  @summary_cost 64
+
   @telemetry_payload_summary_keys MapSet.new([
                                     :content,
                                     "content",
@@ -58,7 +71,8 @@ defmodule Jido.AI.Observe.Sanitize do
     max_list_items: 10,
     max_map_entries: 32,
     max_string_chars: 512,
-    max_inspect_chars: 512
+    max_inspect_chars: 512,
+    max_bytes: 256_000
   }
 
   @transport_defaults %{
@@ -66,7 +80,8 @@ defmodule Jido.AI.Observe.Sanitize do
     max_list_items: 100,
     max_map_entries: 100,
     max_string_chars: 16_384,
-    max_inspect_chars: 2_048
+    max_inspect_chars: 2_048,
+    max_bytes: 2_000_000
   }
 
   @type profile :: :telemetry | :transport
@@ -98,11 +113,11 @@ defmodule Jido.AI.Observe.Sanitize do
   def sanitize(payload, profile, opts \\ [])
 
   def sanitize(payload, :telemetry, opts) when is_list(opts) do
-    sanitize_value(payload, :telemetry, sanitize_opts(@telemetry_defaults, opts), 0)
+    run(payload, :telemetry, sanitize_opts(@telemetry_defaults, opts))
   end
 
   def sanitize(payload, :transport, opts) when is_list(opts) do
-    sanitize_value(payload, :transport, sanitize_opts(@transport_defaults, opts), 0)
+    run(payload, :transport, sanitize_opts(@transport_defaults, opts))
   end
 
   @doc """
@@ -113,6 +128,11 @@ defmodule Jido.AI.Observe.Sanitize do
 
   @doc """
   Sanitizes public/tool payloads into bounded JSON-safe data.
+
+  The depth limit keeps nested fields, and the `:max_bytes` budget keeps the
+  whole payload small. When the budget runs out, the remaining values become
+  the same summaries that the depth limit makes. Sensitive keys are redacted at
+  every depth.
   """
   @spec transport_payload(term(), keyword()) :: term()
   def transport_payload(payload, opts \\ []), do: sanitize(payload, :transport, opts)
@@ -124,39 +144,50 @@ defmodule Jido.AI.Observe.Sanitize do
     end)
   end
 
-  defp sanitize_value(value, _profile, _opts, _depth) when is_nil(value) or is_boolean(value) or is_number(value),
-    do: value
-
-  defp sanitize_value(value, _profile, _opts, _depth) when is_atom(value), do: value
-
-  defp sanitize_value(value, _profile, opts, _depth) when is_binary(value) do
-    sanitize_binary(value, opts.max_string_chars)
+  defp run(payload, profile, opts) do
+    {sanitized, _spent} = sanitize_value(payload, profile, opts, 0, 0)
+    sanitized
   end
 
-  defp sanitize_value(value, profile, opts, depth) when depth >= opts.max_depth do
-    summarize_value(value, profile, opts)
+  # Each clause returns the sanitized value and the bytes spent so far. The
+  # budget is checked before the walk goes into a container, so a payload that
+  # is too large is never expanded.
+  defp sanitize_value(value, _profile, _opts, _depth, spent)
+       when is_nil(value) or is_boolean(value) or is_number(value),
+       do: {value, spent + @scalar_cost}
+
+  defp sanitize_value(value, _profile, _opts, _depth, spent) when is_atom(value),
+    do: {value, spent + atom_cost(value)}
+
+  defp sanitize_value(value, profile, opts, _depth, spent) when spent >= opts.max_bytes,
+    do: {summarize_value(value, profile, opts), spent + @summary_cost}
+
+  defp sanitize_value(value, _profile, opts, _depth, spent) when is_binary(value) do
+    sanitized = sanitize_binary(value, opts.max_string_chars)
+    {sanitized, spent + byte_size(sanitized) + @quote_cost}
   end
 
-  defp sanitize_value(%module{} = value, profile, opts, depth) do
+  defp sanitize_value(value, profile, opts, depth, spent) when depth >= opts.max_depth,
+    do: {summarize_value(value, profile, opts), spent + @summary_cost}
+
+  defp sanitize_value(%module{} = value, profile, opts, depth, spent) do
     cond do
       is_exception(value) ->
-        %{
-          type: module_label(module),
-          message: sanitize_binary(Exception.message(value), opts.max_string_chars)
-        }
+        message = sanitize_binary(Exception.message(value), opts.max_string_chars)
+        {%{type: module_label(module), message: message}, spent + byte_size(message) + @summary_cost}
 
       profile == :transport ->
         value
         |> Map.from_struct()
         |> Map.put(:__struct__, module_label(module))
-        |> sanitize_value(profile, opts, depth + 1)
+        |> sanitize_value(profile, opts, depth + 1, spent)
 
       true ->
-        summarize_value(value, profile, opts)
+        {summarize_value(value, profile, opts), spent + @summary_cost}
     end
   end
 
-  defp sanitize_value(value, profile, opts, depth) when is_map(value) do
+  defp sanitize_value(value, profile, opts, depth, spent) when is_map(value) do
     {entries, omitted_count} =
       value
       |> Enum.take(opts.max_map_entries + 1)
@@ -168,46 +199,64 @@ defmodule Jido.AI.Observe.Sanitize do
         end
       end)
 
-    entries
-    |> Map.new(fn {key, entry_value} ->
-      cond do
-        sensitive_key?(key) ->
-          {sanitize_key(key), @redacted}
+    {pairs, spent} =
+      Enum.map_reduce(entries, spent + @container_cost, fn {key, entry_value}, spent ->
+        sanitized_key = sanitize_key(key)
+        spent = spent + key_cost(sanitized_key)
 
-        profile == :telemetry and telemetry_payload_summary_key?(key) ->
-          {sanitize_key(key), summarize_value(entry_value, profile, opts)}
+        cond do
+          sensitive_key?(key) ->
+            {{sanitized_key, @redacted}, spent + byte_size(@redacted)}
 
-        true ->
-          {sanitize_key(key), sanitize_value(entry_value, profile, opts, depth + 1)}
-      end
-    end)
-    |> maybe_put_truncated(omitted_count)
+          profile == :telemetry and telemetry_payload_summary_key?(key) ->
+            {{sanitized_key, summarize_value(entry_value, profile, opts)}, spent + @summary_cost}
+
+          true ->
+            {sanitized_entry, spent} = sanitize_value(entry_value, profile, opts, depth + 1, spent)
+            {{sanitized_key, sanitized_entry}, spent}
+        end
+      end)
+
+    {pairs |> Map.new() |> maybe_put_truncated(omitted_count), spent}
   end
 
-  defp sanitize_value(value, profile, opts, depth) when is_list(value) do
+  defp sanitize_value(value, profile, opts, depth, spent) when is_list(value) do
     if proper_list?(value) do
       {items, omitted_count} = take_with_omitted_count(value, opts.max_list_items)
 
-      items
-      |> Enum.map(&sanitize_value(&1, profile, opts, depth + 1))
-      |> maybe_append_truncated(omitted_count)
+      {sanitized_items, spent} =
+        Enum.map_reduce(items, spent + @container_cost, fn item, spent ->
+          sanitize_value(item, profile, opts, depth + 1, spent)
+        end)
+
+      {maybe_append_truncated(sanitized_items, omitted_count), spent}
     else
-      summarize_value(value, profile, opts)
+      {summarize_value(value, profile, opts), spent + @summary_cost}
     end
   end
 
-  defp sanitize_value(value, profile, opts, depth) when is_tuple(value) do
+  defp sanitize_value(value, profile, opts, depth, spent) when is_tuple(value) do
     if profile == :transport do
-      value
-      |> Tuple.to_list()
-      |> Enum.map(&sanitize_value(&1, profile, opts, depth + 1))
-      |> then(&%{type: :tuple, items: &1, size: tuple_size(value)})
+      {items, spent} =
+        value
+        |> Tuple.to_list()
+        |> Enum.map_reduce(spent + @container_cost, fn item, spent ->
+          sanitize_value(item, profile, opts, depth + 1, spent)
+        end)
+
+      {%{type: :tuple, items: items, size: tuple_size(value)}, spent}
     else
-      summarize_value(value, profile, opts)
+      {summarize_value(value, profile, opts), spent + @summary_cost}
     end
   end
 
-  defp sanitize_value(value, profile, opts, _depth), do: summarize_value(value, profile, opts)
+  defp sanitize_value(value, profile, opts, _depth, spent),
+    do: {summarize_value(value, profile, opts), spent + @summary_cost}
+
+  defp atom_cost(value), do: byte_size(Atom.to_string(value)) + @quote_cost
+
+  defp key_cost(key) when is_atom(key), do: atom_cost(key) + @key_cost
+  defp key_cost(key) when is_binary(key), do: byte_size(key) + @key_cost + @quote_cost
 
   defp summarize_value(value, profile, opts) do
     value

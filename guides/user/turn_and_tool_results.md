@@ -281,7 +281,7 @@ Subscribe example:
 )
 ```
 
-Telemetry metadata is passed through `Observe.sanitize_telemetry_metadata/1` before emission. Sensitive parameters are redacted, large nested values are bounded, and tool `result` metadata is retained as a low-cardinality summary rather than the raw result blob. Tool-result content sent back through the model/tool transport is encoded through `Observe.sanitize_transport_payload/1` so arbitrary action outputs become bounded JSON-safe data.
+Telemetry metadata passes through `Observe.sanitize_telemetry_metadata/1` before emission. It redacts sensitive parameters, bounds nested values, and summarizes tool results. Model-facing tool results use `Observe.sanitize_transport_payload/2` with a depth limit of 32, which is deep enough for the nested fields that tools return. A byte budget (`:max_bytes`, 2 MB for transport) counts the data as the sanitizer walks the payload, and the remainder becomes a short summary when the budget runs out. Secret redaction, string limits, and collection limits still apply. Unsupported terms become JSON-safe summaries.
 
 ## Failure Mode: Tool Not Found
 

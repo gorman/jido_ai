@@ -139,6 +139,44 @@ defmodule Jido.AI.ObserveTest do
     assert {:ok, _json} = Jason.encode(sanitized)
   end
 
+  test "transport depth stays bounded and :infinity is not a bound" do
+    payload = %{child: %{child: %{name: "Example Approver"}}}
+    bounded = Observe.sanitize_transport_payload(payload, max_depth: 2)
+    assert bounded.child.child == %{type: :map, size: 1, keys: [:name]}
+
+    deep = Enum.reduce(1..12, payload, fn _, value -> %{child: value} end)
+    assert Observe.sanitize_transport_payload(deep, max_depth: 32) == deep
+
+    assert Observe.sanitize_transport_payload(deep, max_depth: :infinity) ==
+             Observe.sanitize_transport_payload(deep)
+  end
+
+  test "transport redacts sensitive keys at the deepest levels" do
+    leaf = %{api_key: "test-secret", name: "Example Approver"}
+    deep = Enum.reduce(1..29, leaf, fn _, value -> %{child: value} end)
+
+    sanitized = Observe.sanitize_transport_payload(deep, max_depth: 32)
+    actual = Enum.reduce(1..29, sanitized, fn _, value -> value.child end)
+
+    assert actual.api_key == "[REDACTED]"
+    assert actual.name == "Example Approver"
+  end
+
+  test "transport payloads under the byte budget keep every field" do
+    payload = %{rows: Enum.map(1..20, &%{id: &1, title: String.duplicate("t", 100)})}
+
+    assert Observe.sanitize_transport_payload(payload, max_bytes: 100_000) == payload
+  end
+
+  test "transport payloads over the byte budget summarize the remainder" do
+    payload = %{rows: Enum.map(1..20, &%{id: &1, title: String.duplicate("t", 100)})}
+
+    rows = Observe.sanitize_transport_payload(payload, max_bytes: 1_000).rows
+
+    assert hd(rows) == %{id: 1, title: String.duplicate("t", 100)}
+    assert %{type: :map, size: 2, keys: [:id, :title]} = List.last(rows)
+  end
+
   test "emit executes telemetry with normalized shape" do
     ref = make_ref()
     handler_id = "observe-test-emit-#{inspect(ref)}"

@@ -292,6 +292,42 @@ defmodule Jido.AI.TurnTest do
   end
 
   describe "format_tool_result_content/1" do
+    test "preserves deeply nested fields while redacting sensitive values" do
+      leaf = %{name: "Example Approver", api_key: "test-secret", callback: fn -> :ok end}
+      nested = Enum.reduce(1..12, leaf, fn _, value -> %{children: [value]} end)
+
+      decoded = decode_tool_content(Turn.format_tool_result_content({:ok, nested}))
+      actual = Enum.reduce(1..12, decoded["result"], fn _, value -> hd(value["children"]) end)
+
+      assert actual["name"] == "Example Approver"
+      assert actual["api_key"] == "[REDACTED]"
+      assert actual["callback"]["type"] == "function"
+    end
+
+    test "bounds shared nested subterms instead of expanding them" do
+      leaf = %{name: "Example Approver", id: 1}
+      bomb = Enum.reduce(1..13, leaf, fn _, value -> %{a: value, b: value, c: value, d: value} end)
+
+      {microseconds, content} = :timer.tc(fn -> Turn.format_tool_result_content({:ok, bomb}) end)
+
+      assert is_binary(content)
+      assert microseconds < 1_000_000
+      assert byte_size(content) <= 2_500_000
+      assert content =~ ~s("type":"map")
+    end
+
+    test "retains string and collection limits inside deeply nested results" do
+      leaf = %{text: String.duplicate("x", 16_385), rows: Enum.to_list(1..101)}
+      nested = Enum.reduce(1..12, leaf, fn _, value -> %{child: value} end)
+
+      decoded = decode_tool_content(Turn.format_tool_result_content({:ok, nested}))
+      actual = Enum.reduce(1..12, decoded["result"], fn _, value -> value["child"] end)
+
+      assert actual["text"] == String.duplicate("x", 16_384) <> "...[truncated]"
+      assert Enum.take(actual["rows"], 100) == Enum.to_list(1..100)
+      assert List.last(actual["rows"]) == %{"__jido_ai_truncated__" => %{"omitted_items" => 1}}
+    end
+
     test "formats common success and error shapes" do
       assert decode_tool_content(Turn.format_tool_result_content({:ok, %{value: 1}})) == %{
                "ok" => true,

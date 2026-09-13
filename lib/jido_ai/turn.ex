@@ -33,6 +33,11 @@ defmodule Jido.AI.Turn do
 
   @default_timeout 30_000
 
+  # Tool results nest collections quickly: a field the model must name sat at
+  # depth 9, and lists add a level of their own. The transport `:max_bytes`
+  # budget keeps the deeper walk bounded.
+  @tool_result_max_depth 32
+
   @type tool_result_content :: String.t() | [ContentPart.t()]
 
   @type tool_result :: %{
@@ -873,7 +878,7 @@ defmodule Jido.AI.Turn do
   defp encode_tool_result_envelope(payload, parts \\ []) when is_map(payload) and is_list(parts) do
     encoded =
       payload
-      |> Observe.sanitize_transport_payload()
+      |> Observe.sanitize_transport_payload(max_depth: @tool_result_max_depth)
       |> Jason.encode!()
 
     case parts do
