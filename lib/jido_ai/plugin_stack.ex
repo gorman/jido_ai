@@ -12,15 +12,19 @@ defmodule Jido.AI.PluginStack do
   @doc """
   Returns the default runtime plugin list for AI agent macros.
 
-  Always includes `TaskSupervisor`, `Policy`, and `ModelRouting`.
-  Optional plugins are enabled via `:retrieval` and `:quota` options.
+  Always includes `TaskSupervisor` and `ModelRouting`. Includes `Policy` unless
+  `policy: false`. Optional plugins are enabled via `:retrieval` and `:quota` options.
   """
   @spec default_plugins(keyword()) :: [module() | {module(), map()}]
   def default_plugins(opts \\ []) when is_list(opts) do
     @default_plugins
+    |> maybe_drop_policy(Keyword.get(opts, :policy, true))
     |> maybe_add_optional(Jido.AI.Plugins.Retrieval, Keyword.get(opts, :retrieval, false))
     |> maybe_add_optional(Jido.AI.Plugins.Quota, Keyword.get(opts, :quota, false))
   end
+
+  defp maybe_drop_policy(plugins, false), do: List.delete(plugins, Jido.AI.Plugins.Policy)
+  defp maybe_drop_policy(plugins, _), do: plugins
 
   defp maybe_add_optional(plugins, _module, false), do: plugins
   defp maybe_add_optional(plugins, module, true), do: plugins ++ [module]
