@@ -29,4 +29,11 @@ defmodule Jido.AI.PluginStackTest do
 
     assert {Jido.AI.Plugins.Quota, %{max_total_tokens: 1000}} in plugins
   end
+
+  test "default_plugins/1 drops Policy when policy: false" do
+    plugins = PluginStack.default_plugins(policy: false)
+
+    refute Jido.AI.Plugins.Policy in plugins
+    assert [TaskSupervisor, Jido.AI.Plugins.ModelRouting] = plugins
+  end
 end
