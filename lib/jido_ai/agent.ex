@@ -57,6 +57,9 @@ defmodule Jido.AI.Agent do
     Runtime reserves `:state` (core Jido-compatible) for tool execution snapshots.
     User-provided values for that key are overwritten per request.
   - `:skills` - Additional skills to attach to the agent (TaskSupervisorSkill is auto-included)
+  - `:policy` - `false` leaves out the default `Jido.AI.Plugins.Policy` plugin (default: `true`).
+    Policy rewrites a query that fails `Jido.AI.Validation.validate_prompt/1` into
+    `ai.request.error`, which ends the request without a runtime event.
   - `:signal_routes` - Additional agent-level signal routes forwarded to `Jido.Agent`.
     ReAct routes are still provided by the default strategy.
 
