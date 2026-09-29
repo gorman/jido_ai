@@ -139,6 +139,32 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerInFlightTest do
     assert failed.data.in_flight == nil
   end
 
+  # The sandbox is billed by container time, so a consumer metering a build
+  # needs the container each call ran in.
+  test "a completed call names the code-execution container it ran in" do
+    parent = self()
+
+    stub_stream_text(fn model -> stream_response([StreamChunk.text("done")], model, parent) end)
+
+    Mimic.stub(ReqLLM.StreamResponse, :process_stream, fn stream_response, _opts ->
+      {:ok,
+       %ReqLLM.Response{
+         id: "resp_container",
+         model: stream_response.model.id,
+         context: ReqLLM.Context.new([]),
+         message: %ReqLLM.Message{role: :assistant, content: [ReqLLM.Message.ContentPart.text("done")]},
+         stream?: false,
+         finish_reason: :stop,
+         usage: %{input_tokens: 10, output_tokens: 2},
+         provider_meta: %{"container" => %{"id" => "container_01abc"}}
+       }}
+    end)
+
+    completed = Enum.find(run(), &(&1.kind == :llm_completed))
+
+    assert completed.data.container_id == "container_01abc"
+  end
+
   defp run(config_opts \\ []) do
     config = Config.new(Map.new([{:model, :capable}, {:tools, %{}} | config_opts]))
 
