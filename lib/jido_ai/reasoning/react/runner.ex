@@ -1643,7 +1643,7 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
     []
     |> Keyword.put(:on_chunk, fn chunk ->
       capture_stream_chunk(chunks_key, chunk)
-      note_in_flight_usage(chunk, state_key, owner, ref)
+      note_in_flight(chunk, state_key, owner, ref)
       note_stream_chunk_activity(chunk, state_key, owner, ref, trace_cfg, heartbeat_interval_ms)
       maybe_emit_server_tool_started(chunk, state_key, owner, ref, model)
     end)
@@ -1721,32 +1721,43 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   defp in_flight_key(ref), do: {__MODULE__, :in_flight, ref}
 
   # Anthropic reports a call's prefill on message_start, so a call that never
-  # finishes has billable usage from its first chunk. It is kept past the
+  # finishes has billable usage from its first chunk. The container it runs in
+  # arrives the same way (message_start for a reused one, message_delta for a
+  # new one), and sandbox time is billed by container. Both are kept past the
   # stream's own cleanup, which a failed or cancelled run reports after.
-  defp note_in_flight_usage(%ReqLLM.StreamChunk{type: :meta, metadata: %{usage: usage}}, state_key, owner, ref)
-       when is_map(usage) do
-    case current_stream_state(state_key, nil) do
-      %State{llm_call_id: call_id} when is_binary(call_id) ->
-        usage = ReqLLM.Usage.normalize(usage)
+  defp note_in_flight(%ReqLLM.StreamChunk{type: :meta, metadata: %{} = metadata}, state_key, owner, ref) do
+    usage = Map.get(metadata, :usage)
+    container_id = chunk_container_id(Map.get(metadata, :container))
 
-        usage =
-          case Process.get(in_flight_key(ref)) do
-            %{llm_call_id: ^call_id, usage: seen} -> ReqLLM.Usage.merge(seen, usage)
-            _ -> usage
-          end
+    with true <- is_map(usage) or is_binary(container_id),
+         %State{llm_call_id: call_id} = current when is_binary(call_id) <- current_stream_state(state_key, nil) do
+      in_flight =
+        case Process.get(in_flight_key(ref)) do
+          %{llm_call_id: ^call_id} = seen -> seen
+          _ -> %{llm_call_id: call_id, usage: nil, container_id: current.container_id}
+        end
+        |> merge_in_flight_usage(usage)
+        |> Map.update!(:container_id, &(container_id || &1))
 
-        in_flight = %{llm_call_id: call_id, usage: usage}
-        Process.put(in_flight_key(ref), in_flight)
-        send(owner, {:react_runner, ref, :in_flight, in_flight})
-
-      _ ->
-        :ok
+      Process.put(in_flight_key(ref), in_flight)
+      send(owner, {:react_runner, ref, :in_flight, in_flight})
     end
 
     :ok
   end
 
-  defp note_in_flight_usage(_chunk, _state_key, _owner, _ref), do: :ok
+  defp note_in_flight(_chunk, _state_key, _owner, _ref), do: :ok
+
+  defp merge_in_flight_usage(in_flight, usage) when is_map(usage) do
+    usage = ReqLLM.Usage.normalize(usage)
+    Map.update!(in_flight, :usage, fn seen -> if seen, do: ReqLLM.Usage.merge(seen, usage), else: usage end)
+  end
+
+  defp merge_in_flight_usage(in_flight, _usage), do: in_flight
+
+  defp chunk_container_id(%{"id" => id}) when is_binary(id), do: id
+  defp chunk_container_id(%{id: id}) when is_binary(id), do: id
+  defp chunk_container_id(_container), do: nil
 
   defp in_flight(ref), do: Process.get(in_flight_key(ref))
   defp forget_in_flight(ref), do: Process.delete(in_flight_key(ref))

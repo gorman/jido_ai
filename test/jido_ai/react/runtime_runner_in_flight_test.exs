@@ -68,6 +68,33 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerInFlightTest do
     assert failed.data.in_flight.usage.cache_creation_tokens == 3_000
   end
 
+  # A build that dies mid-call still ran its sandbox, and sandbox time is billed
+  # by container, so the open call names its container too.
+  test "a stream that dies after naming its container reports the container" do
+    parent = self()
+    container = StreamChunk.meta(%{container: %{"id" => "container_01abc", "expires_at" => "2026-09-30T00:00:00Z"}})
+
+    stub_stream_text(fn model ->
+      stream_response([container, StreamChunk.meta(%{usage: @prefill}), :die], model, parent)
+    end)
+
+    failed = Enum.find(run(max_stream_resumes: 0), &(&1.kind == :request_failed))
+
+    assert failed.data.in_flight.container_id == "container_01abc"
+    assert failed.data.in_flight.usage.cached_tokens == 50_000
+  end
+
+  test "a container named before any usage still reaches in_flight" do
+    parent = self()
+    container = StreamChunk.meta(%{container: %{"id" => "container_01abc"}})
+
+    stub_stream_text(fn model -> stream_response([container, :die], model, parent) end)
+
+    failed = Enum.find(run(max_stream_resumes: 0), &(&1.kind == :request_failed))
+
+    assert failed.data.in_flight == %{llm_call_id: failed.llm_call_id, usage: nil, container_id: "container_01abc"}
+  end
+
   test "a runner that dies mid-call ends in request_failed, not a silent finish" do
     parent = self()
 
