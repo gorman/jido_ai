@@ -89,7 +89,12 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
               receive_timeout_ms: receive_timeout_ms,
               stream_cancel: nil,
               stream_cancelled?: false,
-              ref: ref
+              ref: ref,
+              run_id: initial_state.run_id,
+              request_id: initial_state.request_id,
+              started_ms: monotonic_ms(),
+              last_event: nil,
+              in_flight: nil
             }
           end,
           &next_event(owner, &1),
@@ -135,7 +140,7 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
           |> State.put_result("Request cancelled (reason: #{inspect(reason)})")
 
         {cancelled_state, _} =
-          emit_event(cancelled_state, owner, ref, :request_cancelled, %{reason: reason})
+          emit_event(cancelled_state, owner, ref, :request_cancelled, %{reason: reason, in_flight: in_flight(ref)})
 
         {_cancelled_state, _token} = emit_checkpoint(cancelled_state, owner, ref, config, :terminal)
         send(owner, {:react_runner, ref, :done})
@@ -151,7 +156,8 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
         {failed_state, _} =
           emit_event(failed_state, owner, ref, :request_failed, %{
             error: %{kind: kind, reason: inspect(reason)},
-            error_type: :runtime
+            error_type: :runtime,
+            in_flight: in_flight(ref)
           })
 
         {_failed_state, _token} = emit_checkpoint(failed_state, owner, ref, config, :terminal)
@@ -287,6 +293,8 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
 
       case request_turn(state, owner, ref, config, request.messages, request.llm_opts, request.model) do
         {:ok, state, turn, response_id} ->
+          forget_in_flight(ref)
+
           # A response that ran code execution reports its sandbox container,
           # and every later request in the run must carry the id while work is
           # still in flight — resuming a pause_turn, or returning results for
@@ -347,7 +355,8 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
               content_parts: provider_content_parts(turn),
               tool_calls: turn.tool_calls,
               usage: turn.usage,
-              finish_reason: turn.finish_reason
+              finish_reason: turn.finish_reason,
+              container_id: turn.container_id
             },
             llm_call_id: call_id
           )
@@ -419,7 +428,8 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
           content_parts: turn.content_parts,
           tool_calls: turn.tool_calls,
           usage: turn.usage,
-          finish_reason: turn.finish_reason
+          finish_reason: turn.finish_reason,
+          container_id: turn.container_id
         },
         llm_call_id: call_id
       )
@@ -1411,14 +1421,17 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
       {:react_runner, ^ref, :progress} ->
         next_event(nil, state)
 
+      {:react_runner, ^ref, :in_flight, in_flight} ->
+        next_event(nil, %{state | in_flight: in_flight})
+
       {:react_runner, ^ref, :event, event} ->
-        {[event], state}
+        {[event], note_event(state, event)}
 
       {:react_runner, ^ref, :done} ->
         {:halt, %{state | done?: true}}
     after
       0 ->
-        {:halt, %{state | done?: true}}
+        halt_without_terminal_event(state, :runner_down)
     end
   end
 
@@ -1435,8 +1448,11 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
       {:react_runner, ^ref, :progress} ->
         next_event(nil, state)
 
+      {:react_runner, ^ref, :in_flight, in_flight} ->
+        next_event(nil, %{state | in_flight: in_flight})
+
       {:react_runner, ^ref, :event, event} ->
-        {[event], state}
+        {[event], note_event(state, event)}
 
       {:react_runner, ^ref, :done} ->
         {:halt, %{state | done?: true}}
@@ -1445,8 +1461,64 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
         next_event(nil, %{state | down?: true})
     after
       receive_timeout_ms ->
-        {:halt, %{state | done?: true}}
+        halt_without_terminal_event(state, :runner_receive_timeout)
     end
+  end
+
+  @terminal_kinds [:request_completed, :request_failed, :request_cancelled]
+
+  defp note_event(state, %Event{} = event) do
+    in_flight = if event.kind == :llm_completed, do: nil, else: state.in_flight
+
+    %{
+      state
+      | in_flight: in_flight,
+        last_event: %{
+          kind: event.kind,
+          seq: event.seq,
+          iteration: event.iteration,
+          llm_call_id: event.llm_call_id,
+          at_ms: monotonic_ms()
+        }
+    }
+  end
+
+  defp note_event(state, _event), do: state
+
+  # A consumer must always see how a run ended. Without a terminal event here,
+  # the worker reports a clean finish and the caller waits out its own timeout
+  # with nothing to say about why the run stopped.
+  defp halt_without_terminal_event(%{last_event: %{kind: kind}} = state, _reason) when kind in @terminal_kinds,
+    do: {:halt, %{state | done?: true}}
+
+  defp halt_without_terminal_event(state, reason) do
+    last = state.last_event || %{}
+    ms_since_last_event = monotonic_ms() - Map.get(last, :at_ms, state.started_ms)
+
+    Logger.warning(
+      "ReAct runner halted without a terminal event reason=#{reason} request_id=#{state.request_id} " <>
+        "run_id=#{state.run_id} last_event=#{inspect(Map.get(last, :kind))} " <>
+        "ms_since_last_event=#{ms_since_last_event} llm_call_id=#{inspect(Map.get(last, :llm_call_id))}"
+    )
+
+    event =
+      Event.new(%{
+        seq: Map.get(last, :seq, 0) + 1,
+        run_id: state.run_id,
+        request_id: state.request_id,
+        iteration: Map.get(last, :iteration, 0),
+        kind: :request_failed,
+        llm_call_id: Map.get(last, :llm_call_id),
+        data: %{
+          error: reason,
+          error_type: :timeout,
+          in_flight: state.in_flight,
+          last_event_kind: Map.get(last, :kind),
+          ms_since_last_event: ms_since_last_event
+        }
+      })
+
+    {[event], %{state | done?: true}}
   end
 
   defp notify_progress(owner, ref) do
@@ -1571,6 +1643,7 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
     []
     |> Keyword.put(:on_chunk, fn chunk ->
       capture_stream_chunk(chunks_key, chunk)
+      note_in_flight(chunk, state_key, owner, ref)
       note_stream_chunk_activity(chunk, state_key, owner, ref, trace_cfg, heartbeat_interval_ms)
       maybe_emit_server_tool_started(chunk, state_key, owner, ref, model)
     end)
@@ -1645,6 +1718,49 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   defp stream_signal_key(ref), do: {__MODULE__, :stream_signal, ref}
   defp stream_activity_key(ref), do: {__MODULE__, :stream_activity, ref}
   defp stream_chunks_key(ref), do: {__MODULE__, :stream_chunks, ref}
+  defp in_flight_key(ref), do: {__MODULE__, :in_flight, ref}
+
+  # Anthropic reports a call's prefill on message_start, so a call that never
+  # finishes has billable usage from its first chunk. The container it runs in
+  # arrives the same way (message_start for a reused one, message_delta for a
+  # new one), and sandbox time is billed by container. Both are kept past the
+  # stream's own cleanup, which a failed or cancelled run reports after.
+  defp note_in_flight(%ReqLLM.StreamChunk{type: :meta, metadata: %{} = metadata}, state_key, owner, ref) do
+    usage = Map.get(metadata, :usage)
+    container_id = chunk_container_id(Map.get(metadata, :container))
+
+    with true <- is_map(usage) or is_binary(container_id),
+         %State{llm_call_id: call_id} = current when is_binary(call_id) <- current_stream_state(state_key, nil) do
+      in_flight =
+        case Process.get(in_flight_key(ref)) do
+          %{llm_call_id: ^call_id} = seen -> seen
+          _ -> %{llm_call_id: call_id, usage: nil, container_id: current.container_id}
+        end
+        |> merge_in_flight_usage(usage)
+        |> Map.update!(:container_id, &(container_id || &1))
+
+      Process.put(in_flight_key(ref), in_flight)
+      send(owner, {:react_runner, ref, :in_flight, in_flight})
+    end
+
+    :ok
+  end
+
+  defp note_in_flight(_chunk, _state_key, _owner, _ref), do: :ok
+
+  defp merge_in_flight_usage(in_flight, usage) when is_map(usage) do
+    usage = ReqLLM.Usage.normalize(usage)
+    Map.update!(in_flight, :usage, fn seen -> if seen, do: ReqLLM.Usage.merge(seen, usage), else: usage end)
+  end
+
+  defp merge_in_flight_usage(in_flight, _usage), do: in_flight
+
+  defp chunk_container_id(%{"id" => id}) when is_binary(id), do: id
+  defp chunk_container_id(%{id: id}) when is_binary(id), do: id
+  defp chunk_container_id(_container), do: nil
+
+  defp in_flight(ref), do: Process.get(in_flight_key(ref))
+  defp forget_in_flight(ref), do: Process.delete(in_flight_key(ref))
 
   defp note_stream_chunk_activity(chunk, state_key, owner, ref, trace_cfg, heartbeat_interval_ms) do
     case current_stream_state(state_key, nil) do
@@ -1837,7 +1953,8 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
         emit_event(failed, owner, ref, :request_failed, %{
           error: reason,
           error_type: error_type,
-          usage: failed.usage
+          usage: failed.usage,
+          in_flight: in_flight(ref)
         })
 
       failed
