@@ -555,6 +555,81 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerTest do
     assert assistant_contents(AIContext.to_messages(failed_state.context)) == []
   end
 
+  test "a blank refusal fails with the provider's stop_details in the error" do
+    stop_details = %{"type" => "refusal", "category" => "general_harms"}
+
+    Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
+      {:ok,
+       responses_stream_response(
+         [],
+         %{
+           finish_reason: :content_filter,
+           provider_meta: %{"stop_reason" => "refusal", "stop_details" => stop_details},
+           usage: %{input_tokens: 3, output_tokens: 0}
+         },
+         model
+       )}
+    end)
+
+    config = Config.new(%{model: :capable, tools: %{}})
+
+    events =
+      ReAct.stream("Say hello", config, request_id: "req_blank_refusal", run_id: "req_blank_refusal")
+      |> Enum.to_list()
+
+    request_failed = Enum.find(events, &(&1.kind == :request_failed))
+    assert request_failed.data.error == {:incomplete_response, :content_filter, stop_details}
+    assert request_failed.data.error_type == :llm_response
+  end
+
+  test "a blank refusal with no stop_details still names the refusal" do
+    Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
+      {:ok,
+       responses_stream_response(
+         [],
+         %{finish_reason: :content_filter, usage: %{input_tokens: 3, output_tokens: 0}},
+         model
+       )}
+    end)
+
+    config = Config.new(%{model: :capable, tools: %{}})
+
+    events =
+      ReAct.stream("Say hello", config, request_id: "req_blank_refusal_nil", run_id: "req_blank_refusal_nil")
+      |> Enum.to_list()
+
+    request_failed = Enum.find(events, &(&1.kind == :request_failed))
+    assert request_failed.data.error == {:incomplete_response, :content_filter, nil}
+  end
+
+  test "a refusal after some text carries stop_details on llm_completed" do
+    stop_details = %{"type" => "refusal", "category" => "cyber"}
+
+    Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
+      {:ok,
+       responses_stream_response(
+         [ReqLLM.StreamChunk.text("Here is a start")],
+         %{
+           finish_reason: :content_filter,
+           provider_meta: %{"stop_reason" => "refusal", "stop_details" => stop_details},
+           usage: %{input_tokens: 3, output_tokens: 4}
+         },
+         model
+       )}
+    end)
+
+    config = Config.new(%{model: :capable, tools: %{}})
+
+    events =
+      ReAct.stream("Say hello", config, request_id: "req_partial_refusal", run_id: "req_partial_refusal")
+      |> Enum.to_list()
+
+    llm_completed = Enum.find(events, &(&1.kind == :llm_completed))
+    assert llm_completed.data.finish_reason == :content_filter
+    assert llm_completed.data.stop_details == stop_details
+    assert Enum.any?(events, &(&1.kind == :request_completed))
+  end
+
   test "uses non-streaming generation when streaming is disabled" do
     Mimic.stub(ReqLLM.Generation, :stream_text, fn _model, _messages, _opts ->
       flunk("stream_text should not be called when ReAct streaming is disabled")

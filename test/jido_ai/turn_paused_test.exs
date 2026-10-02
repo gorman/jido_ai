@@ -55,6 +55,24 @@ defmodule Jido.AI.TurnPausedTest do
       assert turn.container_id == "container_abc"
     end
 
+    test "from_response carries the provider's stop_details" do
+      response = paused_response()
+      stop_details = %{"type" => "refusal", "category" => "bio"}
+
+      turn =
+        Turn.from_response(%{
+          response
+          | finish_reason: :content_filter,
+            provider_meta: %{"stop_reason" => "refusal", "stop_details" => stop_details}
+        })
+
+      assert turn.stop_details == stop_details
+    end
+
+    test "stop_details is nil when the response reports none" do
+      assert Turn.from_response(paused_response()).stop_details == nil
+    end
+
     test "container_id is nil when the response reports no container" do
       turn = Turn.from_response(paused_response())
 

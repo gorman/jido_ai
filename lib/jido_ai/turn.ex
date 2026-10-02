@@ -57,6 +57,7 @@ defmodule Jido.AI.Turn do
           model: String.t() | nil,
           finish_reason: atom() | nil,
           stop_reason: String.t() | nil,
+          stop_details: map() | nil,
           container_id: String.t() | nil,
           content_parts: list() | nil,
           message_metadata: map(),
@@ -72,6 +73,7 @@ defmodule Jido.AI.Turn do
             model: nil,
             finish_reason: nil,
             stop_reason: nil,
+            stop_details: nil,
             container_id: nil,
             content_parts: nil,
             message_metadata: %{},
@@ -107,6 +109,7 @@ defmodule Jido.AI.Turn do
       model: Keyword.get(opts, :model, response.model),
       finish_reason: normalize_finish_reason(classified.finish_reason),
       stop_reason: extract_stop_reason(response.provider_meta),
+      stop_details: extract_stop_details(response.provider_meta),
       container_id: extract_container_id(response.provider_meta),
       content_parts: extract_content_parts(response.message),
       message_metadata: normalize_metadata(response.message.metadata),
@@ -461,6 +464,17 @@ defmodule Jido.AI.Turn do
   end
 
   defp extract_stop_reason(_), do: nil
+
+  # Why the provider stopped, when it says. Anthropic sends it with a refusal,
+  # and its `category` names what the model declined.
+  defp extract_stop_details(%{} = provider_meta) do
+    case Map.get(provider_meta, "stop_details") || Map.get(provider_meta, :stop_details) do
+      %{} = details -> details
+      _ -> nil
+    end
+  end
+
+  defp extract_stop_details(_), do: nil
 
   # The code-execution sandbox id (Anthropic `container`). A pause_turn cut
   # with pending code-execution tool uses can only resume when the follow-up

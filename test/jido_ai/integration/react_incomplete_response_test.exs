@@ -93,13 +93,13 @@ defmodule Jido.AI.Integration.ReActIncompleteResponseTest do
       assert {:error, {:failed, :error, {:incomplete_response, :length}}} = result
     end
 
-    test "returns {:error, {:incomplete_response, :content_filter}} for filtered blank responses" do
+    test "returns {:error, {:incomplete_response, :content_filter, stop_details}} for filtered blank responses" do
       stub_blank_stream_response(:content_filter)
 
       pid = start_basic_agent()
       result = BasicAgent.ask_sync(pid, "Hello!", timeout: 5_000)
 
-      assert {:error, {:failed, :error, {:incomplete_response, :content_filter}}} = result
+      assert {:error, {:failed, :error, {:incomplete_response, :content_filter, nil}}} = result
     end
 
     test "successful response with :stop still returns {:ok, text}" do

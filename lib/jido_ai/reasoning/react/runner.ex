@@ -347,7 +347,8 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
               content_parts: provider_content_parts(turn),
               tool_calls: turn.tool_calls,
               usage: turn.usage,
-              finish_reason: turn.finish_reason
+              finish_reason: turn.finish_reason,
+              stop_details: turn.stop_details
             },
             llm_call_id: call_id
           )
@@ -1800,6 +1801,8 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   # Returns :ok for tool-call turns and accepted terminal responses.
   # Rejects blank terminal responses when the provider reported a non-success
   # finish reason so we do not emit a phantom assistant turn or checkpoint it.
+  # A refusal also carries the provider's stop_details (nil when it sent none),
+  # because no llm_completed event goes out to say why the model declined.
   defp validate_terminal_response(%Turn{} = turn) do
     cond do
       Turn.needs_tools?(turn) ->
@@ -1807,6 +1810,9 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
 
       turn.text != "" ->
         :ok
+
+      turn.finish_reason == :content_filter ->
+        {:error, {:incomplete_response, :content_filter, turn.stop_details}}
 
       invalid_blank_terminal_finish_reason?(turn.finish_reason) ->
         {:error, {:incomplete_response, turn.finish_reason}}
