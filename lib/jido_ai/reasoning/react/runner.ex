@@ -1801,18 +1801,20 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   # Returns :ok for tool-call turns and accepted terminal responses.
   # Rejects blank terminal responses when the provider reported a non-success
   # finish reason so we do not emit a phantom assistant turn or checkpoint it.
-  # A refusal also carries the provider's stop_details (nil when it sent none),
+  # A refusal fails even after text or tool calls: its partial output is
+  # incomplete, so it must not reach the context and its tools must not run.
+  # The error carries the provider's stop_details (nil when it sent none),
   # because no llm_completed event goes out to say why the model declined.
   defp validate_terminal_response(%Turn{} = turn) do
     cond do
+      turn.finish_reason == :content_filter ->
+        {:error, {:incomplete_response, :content_filter, turn.stop_details}}
+
       Turn.needs_tools?(turn) ->
         :ok
 
       turn.text != "" ->
         :ok
-
-      turn.finish_reason == :content_filter ->
-        {:error, {:incomplete_response, :content_filter, turn.stop_details}}
 
       invalid_blank_terminal_finish_reason?(turn.finish_reason) ->
         {:error, {:incomplete_response, turn.finish_reason}}

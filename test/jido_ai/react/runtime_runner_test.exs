@@ -602,7 +602,7 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerTest do
     assert request_failed.data.error == {:incomplete_response, :content_filter, nil}
   end
 
-  test "a refusal after some text carries stop_details on llm_completed" do
+  test "a refusal after some text fails and keeps the text out of the context" do
     stop_details = %{"type" => "refusal", "category" => "cyber"}
 
     Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
@@ -618,16 +618,52 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerTest do
        )}
     end)
 
-    config = Config.new(%{model: :capable, tools: %{}})
+    config = Config.new(%{model: :capable, tools: %{}, token_secret: "partial-refusal-secret"})
 
     events =
       ReAct.stream("Say hello", config, request_id: "req_partial_refusal", run_id: "req_partial_refusal")
       |> Enum.to_list()
 
-    llm_completed = Enum.find(events, &(&1.kind == :llm_completed))
-    assert llm_completed.data.finish_reason == :content_filter
-    assert llm_completed.data.stop_details == stop_details
-    assert Enum.any?(events, &(&1.kind == :request_completed))
+    refute Enum.any?(events, &(&1.kind == :llm_completed))
+    refute Enum.any?(events, &(&1.kind == :request_completed))
+
+    request_failed = Enum.find(events, &(&1.kind == :request_failed))
+    assert request_failed.data.error == {:incomplete_response, :content_filter, stop_details}
+
+    terminal_checkpoint = Enum.find(events, &(&1.kind == :checkpoint and &1.data.reason == :terminal))
+
+    assert {:ok, failed_state, _payload} =
+             Jido.AI.Reasoning.ReAct.Token.decode_state(terminal_checkpoint.data.token, config)
+
+    assert assistant_contents(AIContext.to_messages(failed_state.context)) == []
+  end
+
+  test "a refusal with tool calls fails before any tool runs" do
+    Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
+      {:ok,
+       responses_stream_response(
+         [ReqLLM.StreamChunk.tool_call("calculator", %{"a" => 2, "b" => 3}, %{id: "tc_refused"})],
+         %{finish_reason: :content_filter, usage: %{input_tokens: 3, output_tokens: 4}},
+         model
+       )}
+    end)
+
+    config =
+      Config.new(%{
+        model: :capable,
+        tools: %{CalculatorTool.name() => CalculatorTool},
+        tool_max_retries: 0,
+        tool_retry_backoff_ms: 0
+      })
+
+    events =
+      ReAct.stream("Calculate 2 + 3", config, request_id: "req_tool_refusal", run_id: "req_tool_refusal")
+      |> Enum.to_list()
+
+    refute Enum.any?(events, &(&1.kind == :tool_started))
+
+    request_failed = Enum.find(events, &(&1.kind == :request_failed))
+    assert request_failed.data.error == {:incomplete_response, :content_filter, nil}
   end
 
   test "uses non-streaming generation when streaming is disabled" do
