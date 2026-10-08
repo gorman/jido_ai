@@ -448,15 +448,22 @@ defmodule Jido.AI.Turn do
   defp classify_type(_tool_calls, _finish_reason), do: :final_answer
 
   @doc """
-  Whether the provider paused this turn mid-execution — Anthropic's
-  `pause_turn` stop reason (normalized to `:incomplete`, with the raw value
-  preserved in the response's provider metadata). A paused turn is not an
-  answer and not a failure: the caller resumes it by re-sending the
-  conversation with the paused assistant content appended, adding no new
-  user or tool message.
+  Whether the provider stopped this turn mid-execution with nothing for the
+  caller to run. Two stops qualify:
+
+  - Anthropic's `pause_turn` (normalized to `:incomplete`, with the raw value
+    preserved in the response's provider metadata).
+  - A tool-use stop that carries no tool call. Anthropic has sent `tool_use`
+    on a turn that used only server tools, whose results are already in the
+    content.
+
+  A paused turn is not an answer and not a failure: the caller resumes it by
+  re-sending the conversation with the paused assistant content appended, and
+  adds no tool message, because there is no tool call to answer.
   """
   @spec paused?(t()) :: boolean()
   def paused?(%__MODULE__{finish_reason: :incomplete, stop_reason: "pause_turn"}), do: true
+  def paused?(%__MODULE__{type: :tool_calls, tool_calls: []}), do: true
   def paused?(%__MODULE__{}), do: false
 
   defp extract_stop_reason(%{} = provider_meta) do

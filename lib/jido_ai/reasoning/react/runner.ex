@@ -267,6 +267,7 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
       state
       |> State.clear_streaming()
       |> State.put_llm_call_id(call_id)
+      |> ensure_user_message_last()
 
     with {:ok, request} <- build_turn_request(state, config, runtime_context) do
       state = %{state | active_tools: request.tools}
@@ -325,6 +326,21 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
     else
       {:error, reason} ->
         {:error, state, reason, :request_transform}
+    end
+  end
+
+  # The API rejects a request that ends with the model's own message ("does not
+  # support assistant message prefill"). Every path that asks again after an
+  # assistant message adds a user or tool message first. This catches a path
+  # that does not, and continues it the way a paused turn is continued.
+  defp ensure_user_message_last(%State{context: context} = state) do
+    case AIContext.last_entry(context) do
+      %{role: :assistant} ->
+        Logger.warning("react continuation: context ended with an assistant message run_id=#{state.run_id}")
+        %{state | context: AIContext.append_user(context, @continuation_message)}
+
+      _entry ->
+        state
     end
   end
 
@@ -395,7 +411,8 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   end
 
   # The provider paused the turn mid-execution (Anthropic's pause_turn during
-  # server-tool use). Append the paused assistant content — including the
+  # server-tool use, or a tool-use stop with no tool call to run; see
+  # Turn.paused?/1). Append the paused assistant content — including the
   # provider-native blocks the resume depends on — plus a minimal user message,
   # and loop for another LLM call. The trailing user message exists because some
   # gateways (Azure Foundry) reject a conversation that ends with an assistant
