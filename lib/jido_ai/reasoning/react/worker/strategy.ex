@@ -263,17 +263,25 @@ defmodule Jido.AI.Reasoning.ReAct.Worker.Strategy do
 
   defp process_runtime_event(agent, _params), do: {agent, []}
 
+  # A terminal event already finished the run, so a run still active here ended
+  # without one: the runner's stream halted when its wait for the next event ran
+  # out. Say so, or the parent keeps the request active and refuses every later
+  # ask as busy.
   defp process_runtime_done(agent, %{request_id: request_id}) do
     state = StratState.get(agent, %{})
 
-    new_state =
-      if state[:active_request_id] == request_id do
-        finish_state(state)
-      else
-        state
-      end
+    if state[:active_request_id] == request_id do
+      event =
+        synthesize_event(state, :request_failed, request_id, state[:run_id] || request_id, %{
+          error: :runtime_ended_without_terminal_event,
+          error_type: :runtime_ended
+        })
 
-    {put_strategy_state(agent, new_state), []}
+      directives = List.wrap(emit_parent_event(agent, request_id, event))
+      {put_strategy_state(agent, finish_state(state)), directives}
+    else
+      {agent, []}
+    end
   end
 
   defp process_runtime_done(agent, _params), do: {agent, []}
