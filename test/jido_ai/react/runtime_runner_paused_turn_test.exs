@@ -2,8 +2,9 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerPausedTurnTest do
   use ExUnit.Case, async: false
   use Mimic
 
+  alias Jido.AI.Context, as: AIContext
   alias Jido.AI.Reasoning.ReAct
-  alias Jido.AI.Reasoning.ReAct.Config
+  alias Jido.AI.Reasoning.ReAct.{Config, State}
   alias ReqLLM.Message.ContentPart
   alias ReqLLM.StreamChunk
 
@@ -123,7 +124,72 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerPausedTurnTest do
     assert Keyword.get(opts, :anthropic_container) == "cntr_pause"
   end
 
-  defp stub_stream_text(paused_chunks) do
+  # Anthropic has stopped with "tool_use" on a turn that used only server
+  # tools, so there was no client call for the runner to answer. Running an
+  # empty tool round left the assistant message last, and the API rejects a
+  # request that ends with one.
+  test "a tool_use stop with no client tool call is resumed like a pause" do
+    Mimic.stub(ReqLLM.Provider.ResponseBuilder, :for_model, fn _model -> ForkResponseBuilder end)
+
+    stub_stream_text(
+      [
+        tool_use_chunk("srvtoolu_search", "web_search"),
+        tool_result_chunk("srvtoolu_search", "web_search_tool_result"),
+        StreamChunk.text("Found it")
+      ],
+      %{finish_reason: :tool_calls, provider_meta: %{"stop_reason" => "tool_use"}}
+    )
+
+    log = ExUnit.CaptureLog.capture_log(fn -> send(self(), {:events, run("look it up")}) end)
+    assert_received {:events, events}
+
+    completed = Enum.find(events, &(&1.kind == :request_completed))
+    assert completed.data.result == "Finished answer"
+    refute Enum.any?(events, &(&1.kind == :tool_started))
+    refute log =~ "context ended with an assistant message"
+
+    assert_receive {:messages, 2, second}
+
+    assert [%{role: :assistant, content: replayed}, %{role: :user, content: "continue"}] =
+             Enum.take(second, -2)
+
+    assert [
+             %ContentPart{type: :provider_block, data: %{"id" => "srvtoolu_search"}},
+             %ContentPart{type: :provider_block, data: %{"tool_use_id" => "srvtoolu_search"}},
+             %ContentPart{type: :text, text: "Found it"}
+           ] = replayed
+  end
+
+  # A guard for any path that leaves the model's own message last: the API
+  # rejects that request ("does not support assistant message prefill").
+  test "a run whose context ends with an assistant message asks with a continuation" do
+    stub_stream_text([StreamChunk.text("unused")])
+
+    state =
+      State.new("build the deck", nil, request_id: "req_pause", run_id: "run_pause")
+      |> then(&%{&1 | context: AIContext.append_assistant(&1.context, "Halfway there")})
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        events =
+          ReAct.stream("build the deck", Config.new(%{model: :capable, tools: %{}}), state: state)
+          |> Enum.to_list()
+
+        assert Enum.any?(events, &(&1.kind == :request_completed))
+      end)
+
+    assert log =~ "context ended with an assistant message"
+
+    assert_receive {:messages, 1, first}
+
+    assert [
+             %{role: :user},
+             %{role: :assistant},
+             %{role: :user, content: "continue"}
+           ] = first
+  end
+
+  defp stub_stream_text(paused_chunks, metadata \\ nil) do
     parent = self()
 
     Mimic.stub(ReqLLM.Generation, :stream_text, fn model, messages, opts ->
@@ -132,8 +198,9 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerPausedTurnTest do
       send(parent, {:messages, call, messages})
       send(parent, {:opts, call, opts})
 
-      case call do
-        1 -> {:ok, paused_response(model, paused_chunks)}
+      case {call, metadata} do
+        {1, nil} -> {:ok, paused_response(model, paused_chunks)}
+        {1, metadata} -> {:ok, stream_response(paused_chunks, model, metadata)}
         _ -> {:ok, final_response(model)}
       end
     end)

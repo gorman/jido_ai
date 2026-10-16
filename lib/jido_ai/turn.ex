@@ -57,6 +57,7 @@ defmodule Jido.AI.Turn do
           model: String.t() | nil,
           finish_reason: atom() | nil,
           stop_reason: String.t() | nil,
+          stop_details: map() | nil,
           container_id: String.t() | nil,
           content_parts: list() | nil,
           message_metadata: map(),
@@ -72,6 +73,7 @@ defmodule Jido.AI.Turn do
             model: nil,
             finish_reason: nil,
             stop_reason: nil,
+            stop_details: nil,
             container_id: nil,
             content_parts: nil,
             message_metadata: %{},
@@ -107,6 +109,7 @@ defmodule Jido.AI.Turn do
       model: Keyword.get(opts, :model, response.model),
       finish_reason: normalize_finish_reason(classified.finish_reason),
       stop_reason: extract_stop_reason(response.provider_meta),
+      stop_details: extract_stop_details(response.provider_meta),
       container_id: extract_container_id(response.provider_meta),
       content_parts: extract_content_parts(response.message),
       message_metadata: normalize_metadata(response.message.metadata),
@@ -445,15 +448,22 @@ defmodule Jido.AI.Turn do
   defp classify_type(_tool_calls, _finish_reason), do: :final_answer
 
   @doc """
-  Whether the provider paused this turn mid-execution — Anthropic's
-  `pause_turn` stop reason (normalized to `:incomplete`, with the raw value
-  preserved in the response's provider metadata). A paused turn is not an
-  answer and not a failure: the caller resumes it by re-sending the
-  conversation with the paused assistant content appended, adding no new
-  user or tool message.
+  Whether the provider stopped this turn mid-execution with nothing for the
+  caller to run. Two stops qualify:
+
+  - Anthropic's `pause_turn` (normalized to `:incomplete`, with the raw value
+    preserved in the response's provider metadata).
+  - A tool-use stop that carries no tool call. Anthropic has sent `tool_use`
+    on a turn that used only server tools, whose results are already in the
+    content.
+
+  A paused turn is not an answer and not a failure: the caller resumes it by
+  re-sending the conversation with the paused assistant content appended, and
+  adds no tool message, because there is no tool call to answer.
   """
   @spec paused?(t()) :: boolean()
   def paused?(%__MODULE__{finish_reason: :incomplete, stop_reason: "pause_turn"}), do: true
+  def paused?(%__MODULE__{type: :tool_calls, tool_calls: []}), do: true
   def paused?(%__MODULE__{}), do: false
 
   defp extract_stop_reason(%{} = provider_meta) do
@@ -461,6 +471,17 @@ defmodule Jido.AI.Turn do
   end
 
   defp extract_stop_reason(_), do: nil
+
+  # Why the provider stopped, when it says. Anthropic sends it with a refusal,
+  # and its `category` names what the model declined.
+  defp extract_stop_details(%{} = provider_meta) do
+    case Map.get(provider_meta, "stop_details") || Map.get(provider_meta, :stop_details) do
+      %{} = details -> details
+      _ -> nil
+    end
+  end
+
+  defp extract_stop_details(_), do: nil
 
   # The code-execution sandbox id (Anthropic `container`). A pause_turn cut
   # with pending code-execution tool uses can only resume when the follow-up
