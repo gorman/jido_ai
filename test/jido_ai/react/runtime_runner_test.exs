@@ -1178,6 +1178,43 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerTest do
     assert request_completed.data.result == String.duplicate("x", 200)
   end
 
+  # Sonnet 5.5 on Azure streams a large tool input as nothing but `ping` events,
+  # every 30s, for minutes. The consumer's wait (`stream_timeout_ms`) must treat
+  # them as activity, or a working call is halted with no terminal event.
+  for capture_deltas? <- [true, false] do
+    test "keepalive pings keep a stream alive past stream_timeout_ms (capture_deltas?: #{capture_deltas?})" do
+      pings =
+        for _ <- 1..20, do: ReqLLM.StreamChunk.meta(%{keepalive?: true, provider_event: :ping})
+
+      Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
+        {:ok,
+         responses_stream_response(
+           delayed_stream(pings ++ [ReqLLM.StreamChunk.text("done")], 50),
+           %{finish_reason: :stop, usage: %{input_tokens: 1, output_tokens: 1}},
+           model
+         )}
+      end)
+
+      config =
+        Config.new(%{
+          model: :capable,
+          tools: %{},
+          capture_deltas?: unquote(capture_deltas?),
+          stream_timeout_ms: 300
+        })
+
+      started_at = System.monotonic_time(:millisecond)
+      events = ReAct.stream("build it", config) |> Enum.to_list()
+      elapsed_ms = System.monotonic_time(:millisecond) - started_at
+
+      assert elapsed_ms >= 1_000
+      request_completed = Enum.find(events, &(&1.kind == :request_completed))
+
+      assert request_completed, "halted after #{elapsed_ms}ms; events: #{inspect(Enum.map(events, & &1.kind))}"
+      assert request_completed.data.result == "done"
+    end
+  end
+
   test "halts inactive streams after stream_timeout_ms" do
     parent = self()
 
