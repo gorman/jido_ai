@@ -35,6 +35,23 @@ defmodule Jido.AI.TurnPausedTest do
       assert Turn.paused?(turn)
     end
 
+    test "a tool_use stop with no client tool call is paused" do
+      response = %{paused_response() | finish_reason: :tool_calls, provider_meta: %{"stop_reason" => "tool_use"}}
+      turn = Turn.from_response(response)
+
+      assert turn.type == :tool_calls
+      assert turn.tool_calls == []
+      assert Turn.paused?(turn)
+    end
+
+    test "a turn with a client tool call is not paused" do
+      tool_call = ReqLLM.ToolCall.new("toolu_1", "list_moments", "{}")
+      response = %{paused_response() | finish_reason: :tool_calls, provider_meta: %{"stop_reason" => "tool_use"}}
+      turn = Turn.from_response(put_in(response.message.tool_calls, [tool_call]))
+
+      refute Turn.paused?(turn)
+    end
+
     test "paused? is false for ordinary completions and other incomplete reasons" do
       refute Turn.paused?(%Turn{finish_reason: :stop, stop_reason: nil})
       refute Turn.paused?(%Turn{finish_reason: :incomplete, stop_reason: nil})
@@ -53,6 +70,24 @@ defmodule Jido.AI.TurnPausedTest do
       turn = Turn.from_response(%{response | provider_meta: provider_meta})
 
       assert turn.container_id == "container_abc"
+    end
+
+    test "from_response carries the provider's stop_details" do
+      response = paused_response()
+      stop_details = %{"type" => "refusal", "category" => "bio"}
+
+      turn =
+        Turn.from_response(%{
+          response
+          | finish_reason: :content_filter,
+            provider_meta: %{"stop_reason" => "refusal", "stop_details" => stop_details}
+        })
+
+      assert turn.stop_details == stop_details
+    end
+
+    test "stop_details is nil when the response reports none" do
+      assert Turn.from_response(paused_response()).stop_details == nil
     end
 
     test "container_id is nil when the response reports no container" do
