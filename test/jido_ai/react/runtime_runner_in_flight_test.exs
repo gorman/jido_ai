@@ -134,6 +134,115 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerInFlightTest do
     assert cancelled.data.in_flight.usage.cached_tokens == 50_000
   end
 
+  # A real stop does not raise. The provider's cancel ends the stream cleanly
+  # with a `:cancelled` finish, so the runner sees a blank turn, not a stream error.
+  test "a stop that ends the stream cleanly is a cancel that reports the open call's prefill" do
+    parent = self()
+
+    stub_stream_text(fn model ->
+      stream_response(
+        [StreamChunk.meta(%{usage: @prefill}), :stall_then_end],
+        model,
+        parent,
+        %{finish_reason: :cancelled}
+      )
+    end)
+
+    consumer =
+      spawn(fn ->
+        send(parent, {:events, run(max_stream_resumes: 0) |> Enum.to_list()})
+      end)
+
+    assert_receive {:stalled, _runner}, 1_000
+    send(consumer, {:react_stream_cancel, :user_stop})
+
+    assert_receive {:events, events}, 1_000
+
+    # The runner must already hold the cancel when its stream ends, or the blank
+    # turn the stop leaves behind is reported as a failure.
+    assert_received {:cancel_queued?, true}
+
+    started = Enum.find(events, &(&1.kind == :llm_started))
+    refute Enum.any?(events, &(&1.kind == :request_failed))
+    cancelled = Enum.find(events, &(&1.kind == :request_cancelled))
+
+    assert cancelled.data.reason == :user_stop
+    assert cancelled.data.in_flight.llm_call_id == started.data.call_id
+    assert cancelled.data.in_flight.usage.cached_tokens == 50_000
+  end
+
+  # A stop lands mid tool call more often than not: the model streams a long
+  # argument object, and the cut leaves a tool call with whatever parsed. That
+  # call must not run, and the turn is the stop's, not a finished round.
+  test "a stop during a streaming tool call is a cancel, and the truncated call never runs" do
+    parent = self()
+
+    stub_stream_text(fn model ->
+      stream_response(
+        [
+          StreamChunk.meta(%{usage: @prefill}),
+          StreamChunk.tool_call("propose_blocks", %{}, %{id: "tc_cut"}),
+          :stall_then_end
+        ],
+        model,
+        parent,
+        %{finish_reason: :cancelled}
+      )
+    end)
+
+    consumer =
+      spawn(fn ->
+        send(parent, {:events, run(max_stream_resumes: 0) |> Enum.to_list()})
+      end)
+
+    assert_receive {:stalled, _runner}, 1_000
+    send(consumer, {:react_stream_cancel, :user_stop})
+
+    assert_receive {:events, events}, 1_000
+
+    kinds = Enum.map(events, & &1.kind)
+    refute :llm_completed in kinds
+    refute :tool_started in kinds
+    refute :request_failed in kinds
+
+    started = Enum.find(events, &(&1.kind == :llm_started))
+    cancelled = Enum.find(events, &(&1.kind == :request_cancelled))
+    assert cancelled.data.reason == :user_stop
+    assert cancelled.data.in_flight.llm_call_id == started.data.call_id
+    assert cancelled.data.in_flight.usage.cached_tokens == 50_000
+  end
+
+  test "a stop during streaming text is a cancel, not a final answer" do
+    parent = self()
+
+    stub_stream_text(fn model ->
+      stream_response(
+        [StreamChunk.meta(%{usage: @prefill}), StreamChunk.text("Plan created. I'm adding"), :stall_then_end],
+        model,
+        parent,
+        %{finish_reason: :cancelled}
+      )
+    end)
+
+    consumer =
+      spawn(fn ->
+        send(parent, {:events, run(max_stream_resumes: 0) |> Enum.to_list()})
+      end)
+
+    assert_receive {:stalled, _runner}, 1_000
+    send(consumer, {:react_stream_cancel, :user_stop})
+
+    assert_receive {:events, events}, 1_000
+
+    kinds = Enum.map(events, & &1.kind)
+    refute :llm_completed in kinds
+    refute :request_completed in kinds
+
+    cancelled = Enum.find(events, &(&1.kind == :request_cancelled))
+    assert cancelled.data.reason == :user_stop
+    assert cancelled.data.in_flight.usage.cached_tokens == 50_000
+  end
+
   test "a call that completed is no longer in flight when a later request fails" do
     parent = self()
     :persistent_term.put({__MODULE__, :calls}, 0)
@@ -219,8 +328,9 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerInFlightTest do
             :wake -> raise closed_error()
           end
 
-        # A real stream dies as soon as its cancel lands; waking on the runner's
-        # own cancel message keeps the test off the cancel-vs-error race.
+        # A transport that closes on the cancel instead of ending cleanly, which
+        # is the `:stall_then_end` case below. Wakes on the runner's own cancel
+        # message so the close is ordered after it.
         :stall_until_cancel ->
           send(parent, {:stalled, self()})
 
@@ -228,6 +338,19 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerInFlightTest do
             {:react_cancel, _ref, _reason} = cancel ->
               send(self(), cancel)
               raise closed_error()
+          end
+
+        # The stream's cancel wakes it and it ends with no further chunk and no
+        # error, as a real provider stream does on a stop.
+        :stall_then_end ->
+          :persistent_term.put({__MODULE__, :stalled}, self())
+          send(parent, {:stalled, self()})
+
+          receive do
+            :wake ->
+              {:messages, queued} = Process.info(self(), :messages)
+              send(parent, {:cancel_queued?, Enum.any?(queued, &match?({:react_cancel, _ref, _reason}, &1))})
+              nil
           end
 
         :die ->
@@ -239,6 +362,7 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerInFlightTest do
         chunk ->
           chunk
       end)
+      |> Stream.reject(&is_nil/1)
 
     %ReqLLM.StreamResponse{
       stream: stream,
