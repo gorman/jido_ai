@@ -294,8 +294,6 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
 
       case request_turn(state, owner, ref, config, request.messages, request.llm_opts, request.model) do
         {:ok, state, turn, response_id} ->
-          forget_in_flight(ref)
-
           # A response that ran code execution reports its sandbox container,
           # and every later request in the run must carry the id while work is
           # still in flight — resuming a pause_turn, or returning results for
@@ -378,6 +376,11 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
             llm_call_id: call_id
           )
 
+        # Only `llm_completed` carries the call's usage, so the open call stays in
+        # flight until it goes out. A stop ends the stream with a cut turn that is
+        # rejected above, and that call still billed its prefill.
+        forget_in_flight(ref)
+
         state =
           AIContext.append_assistant(
             state.context,
@@ -451,6 +454,8 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
         },
         llm_call_id: call_id
       )
+
+    forget_in_flight(ref)
 
     state =
       state.context
@@ -1938,10 +1943,17 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   # incomplete, so it must not reach the context and its tools must not run.
   # The error carries the provider's stop_details (nil when it sent none),
   # because no llm_completed event goes out to say why the model declined.
+  # A cancelled stream is cut the same way: a stop usually lands while a tool
+  # call's arguments are still streaming, and running the truncated call is
+  # not what the user asked for. The rejection reaches `fail_run/6`, which
+  # finds the stop waiting and ends the run as cancelled.
   defp validate_terminal_response(%Turn{} = turn) do
     cond do
       turn.finish_reason == :content_filter ->
         {:error, {:incomplete_response, :content_filter, turn.stop_details}}
+
+      turn.finish_reason == :cancelled ->
+        {:error, {:incomplete_response, :cancelled}}
 
       Turn.needs_tools?(turn) ->
         :ok
@@ -1961,11 +1973,10 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   defp invalid_blank_terminal_finish_reason?(_reason), do: true
 
   defp fail_run(%State{} = state, owner, ref, %Config{} = config, reason, error_type) do
-    # A cancelled stream fails on its way out, so the error can get here with the
-    # cancel still unread: `request_stream_cancel/2` tears the stream down before it
-    # signals this process. Check once more before calling it a failure, otherwise a
-    # deliberate stop is reported as one. The cancel path does its own sealing, so
-    # this has to come first.
+    # A stop reaches here as a rejected turn: `request_stream_cancel/2` sends the
+    # cancel before it ends the stream, so the message is already waiting. Read it
+    # now, otherwise a deliberate stop is reported as a failure. The cancel path
+    # does its own sealing, so this has to come first.
     check_cancel!(state, ref)
 
     seal_pending_input_server(config)
@@ -2010,18 +2021,19 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
 
   defp request_stream_cancel(%{cancel_sent?: true} = state, _reason), do: state
 
+  # The runner hears about the cancel before its stream does. A cancelled stream
+  # ends cleanly with a cut turn, and `fail_run/6` only calls that a stop if the
+  # cancel is already waiting.
   defp request_stream_cancel(%{pid: pid, ref: ref} = state, reason) when is_pid(pid) do
-    state =
-      state
-      |> maybe_capture_stream_control()
-      |> invoke_stream_cancel()
-
     case Process.alive?(pid) do
       true -> send(pid, {:react_cancel, ref, reason})
       _ -> :ok
     end
 
-    Map.put(state, :cancel_sent?, true)
+    state
+    |> maybe_capture_stream_control()
+    |> invoke_stream_cancel()
+    |> Map.put(:cancel_sent?, true)
   end
 
   defp request_stream_cancel(state, _reason) do
