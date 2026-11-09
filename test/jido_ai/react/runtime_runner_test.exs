@@ -202,6 +202,24 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerTest do
     end
   end
 
+  defmodule RoundResultsTransformer do
+    def transform_request(_request, _state, _config, _runtime_context), do: {:ok, %{}}
+
+    def transform_tool_results(results, _context) do
+      names = Enum.map(results, &elem(&1, 0))
+
+      Enum.map(results, fn
+        {"fast_order_tool", {:ok, value, effects}} -> {:ok, Map.put(value, :round, names), effects}
+        {_name, result} -> result
+      end)
+    end
+  end
+
+  defmodule BrokenRoundResultsTransformer do
+    def transform_request(_request, _state, _config, _runtime_context), do: {:ok, %{}}
+    def transform_tool_results(_results, _context), do: raise("boom")
+  end
+
   defmodule RuntimeAnthropicModelTransformer do
     def transform_request(_request, _state, _config, _runtime_context) do
       {:ok, %{model: "anthropic:claude-sonnet-4-5"}}
@@ -1685,6 +1703,80 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerTest do
       |> Enum.map(& &1.data.tool_call_id)
 
     assert tool_completed_ids == ["tc_slow", "tc_fast"]
+  end
+
+  test "a request transformer sees a round's results in call order before they are reported" do
+    test_pid = self()
+
+    Mimic.stub(ReqLLM.Generation, :stream_text, fn model, messages, _opts ->
+      count = :persistent_term.get({__MODULE__, :llm_call_count}, 0) + 1
+      :persistent_term.put({__MODULE__, :llm_call_count}, count)
+
+      if count == 1 do
+        {:ok,
+         responses_stream_response(
+           [
+             ReqLLM.StreamChunk.tool_call("slow_order_tool", %{}, %{id: "tc_slow"}),
+             ReqLLM.StreamChunk.tool_call("fast_order_tool", %{}, %{id: "tc_fast"})
+           ],
+           %{finish_reason: :tool_calls, usage: %{input_tokens: 6, output_tokens: 3}},
+           model
+         )}
+      else
+        send(test_pid, {:second_call_messages, messages})
+
+        {:ok,
+         responses_stream_response(
+           [ReqLLM.StreamChunk.text("Tool round complete")],
+           %{finish_reason: :stop, usage: %{input_tokens: 2, output_tokens: 1}},
+           model
+         )}
+      end
+    end)
+
+    config =
+      Config.new(%{
+        model: :capable,
+        tools: %{SlowOrderTool.name() => SlowOrderTool, FastOrderTool.name() => FastOrderTool},
+        request_transformer: RoundResultsTransformer,
+        tool_max_retries: 0,
+        tool_retry_backoff_ms: 0
+      })
+
+    events = ReAct.stream("Run tools in order", config) |> Enum.to_list()
+
+    results =
+      for %{kind: :tool_completed, data: data} <- events, into: %{}, do: {data.tool_call_id, data.result}
+
+    assert {:ok, %{marker: :fast, round: ["slow_order_tool", "fast_order_tool"]}, [_effect]} =
+             results["tc_fast"]
+
+    assert {:ok, %{marker: :slow} = slow, [_effect]} = results["tc_slow"]
+    refute Map.has_key?(slow, :round)
+
+    assert_receive {:second_call_messages, messages}
+    fast = Enum.find(messages, &(&1[:tool_call_id] == "tc_fast"))
+    assert %{"result" => %{"round" => ["slow_order_tool", "fast_order_tool"]}} = Jason.decode!(fast.content)
+  end
+
+  test "a request transformer that raises on a round's results leaves them as they were" do
+    stub_parallel_order_run()
+
+    config =
+      Config.new(%{
+        model: :capable,
+        tools: %{SlowOrderTool.name() => SlowOrderTool, FastOrderTool.name() => FastOrderTool},
+        request_transformer: BrokenRoundResultsTransformer,
+        tool_max_retries: 0,
+        tool_retry_backoff_ms: 0
+      })
+
+    events = ReAct.stream("Run tools in order", config) |> Enum.to_list()
+
+    assert [{:ok, %{marker: :slow}, _}, {:ok, %{marker: :fast}, _}] =
+             for(%{kind: :tool_completed, data: data} <- events, do: data.result)
+
+    assert Enum.any?(events, &(&1.kind == :request_completed))
   end
 
   test "strategy applies tool effects in deterministic call order" do

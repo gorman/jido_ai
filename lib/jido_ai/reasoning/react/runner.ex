@@ -1002,6 +1002,7 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
             {:ok, result} -> result
             {:exit, reason} -> {:error, %{type: :task_exit, reason: inspect(reason)}}
           end)
+          |> transform_tool_results(config, context)
 
         {state, updated_context} =
           Enum.reduce(results, {state, state.context}, fn
@@ -1056,6 +1057,51 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
       {:error, reason} ->
         {:error, State.put_status(state, :failed), reason, :tool_guardrail}
     end
+  end
+
+  defp transform_tool_results(results, %Config{request_transformer: module}, context)
+       when is_atom(module) and not is_nil(module) do
+    if Code.ensure_loaded?(module) and function_exported?(module, :transform_tool_results, 2) do
+      apply_tool_results_transformer(results, module, context)
+    else
+      results
+    end
+  end
+
+  defp transform_tool_results(results, _config, _context), do: results
+
+  defp apply_tool_results_transformer(results, module, context) do
+    finished = for {%PendingToolCall{name: name}, result, _attempts, _duration_ms} <- results, do: {name, result}
+
+    case module.transform_tool_results(finished, context) do
+      transformed when is_list(transformed) and length(transformed) == length(finished) ->
+        {results, []} =
+          Enum.map_reduce(results, transformed, fn
+            {%PendingToolCall{} = call, _result, attempts, duration_ms}, [result | rest] ->
+              {{call, result, attempts, duration_ms}, rest}
+
+            failed, rest ->
+              {failed, rest}
+          end)
+
+        results
+
+      other ->
+        Logger.error("tool results transformer returned an invalid result",
+          transformer: inspect(module),
+          result: inspect(other, limit: 20)
+        )
+
+        results
+    end
+  rescue
+    e ->
+      Logger.error("tool results transformer raised",
+        transformer: inspect(module),
+        error: Exception.format(:error, e, __STACKTRACE__)
+      )
+
+      results
   end
 
   # A failed terminal tool must not end the turn — the model still has to see the

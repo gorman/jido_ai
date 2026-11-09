@@ -19,6 +19,12 @@ defmodule Jido.AI.Reasoning.ReAct.RequestTransformer do
 
   The runtime always regenerates `llm_opts[:tools]` from the returned `tools`
   field so the exposed LLM tools and execution registry stay aligned.
+
+  A transformer can also implement `c:transform_tool_results/2` to rewrite a
+  tool round's results. The calls of one round run concurrently against one
+  state snapshot, so no call can see another's result. The callback runs once
+  every call of the round has finished, before any result is reported in a
+  `tool_completed` event, appended to the context, or applied as an effect.
   """
 
   alias Jido.AI.Reasoning.ReAct.{Config, State, ToolSelection}
@@ -71,4 +77,17 @@ defmodule Jido.AI.Reasoning.ReAct.RequestTransformer do
 
   @callback transform_request(request(), State.t(), Config.t(), map()) ::
               {:ok, overrides()} | {:error, term()}
+
+  @doc """
+  Rewrite one tool round's results. Gets `{tool_name, result}` for each call
+  that finished, in call order, and the tool context the calls ran with. Returns
+  the results, in the same order and of the same length.
+
+  A raise, or a list of another length, is logged and the round keeps its
+  original results: the tools have already run, so their results must still
+  reach the model and the event stream.
+  """
+  @callback transform_tool_results([{String.t(), term()}], map()) :: [term()]
+
+  @optional_callbacks transform_tool_results: 2
 end
